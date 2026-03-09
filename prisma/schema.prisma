@@ -1,0 +1,208 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+//////////////////////////////////////////////////////
+// ADMIN TABLE (Super Admin SaaS Owner)
+//////////////////////////////////////////////////////
+
+model Admin {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  password     String
+  refreshToken String?
+
+  shops Shop[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+//////////////////////////////////////////////////////
+// SHOP TABLE (Multi Shop Support)
+//////////////////////////////////////////////////////
+
+model Shop {
+  id      Int    @id @default(autoincrement())
+  adminId Int
+
+  name    String
+  address String?
+  phone   String?
+  logo    String?
+
+  admin Admin @relation(fields: [adminId], references: [id])
+  categories Category[]
+
+  products Product[]
+  bills    Bill[]
+  stockLogs StockTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([adminId])
+}
+
+//////////////////////////////////////////////////////
+// CATEGORY TABLE
+//////////////////////////////////////////////////////
+
+model Category {
+  id    Int     @id @default(autoincrement())
+  shopId Int
+  name  String  @unique
+  image String?
+
+  shop Shop @relation(fields: [shopId], references: [id])
+
+  products Product[]
+
+  createdAt DateTime @default(now())
+}
+
+//////////////////////////////////////////////////////
+// PRODUCT TABLE (Stock Master Table)
+//////////////////////////////////////////////////////
+
+model Product {
+  id            Int     @id @default(autoincrement())
+  shopId        Int
+  categoryId    Int?
+
+  name          String
+  image         String?
+
+  // 🔥 Stock Control Mode
+  stockType     String  @default("quantity") // quantity | area | length
+
+  // Quantity Stock
+  stockQuantity Float   @default(0)
+
+  // Area Stock (stored in CM²)
+  stockAreaCm2  Float   @default(0)
+
+  // Length Stock (stored in CM)
+  stockLengthCm Float   @default(0)
+
+  // Sheet Info (For Area-Based Products)
+  sheetWidthCm  Float?
+  sheetHeightCm Float?
+  sheetAreaCm2  Float?
+
+  purchasePrice Float
+  salePrice     Float
+
+  shop     Shop      @relation(fields: [shopId], references: [id])
+  category Category? @relation(fields: [categoryId], references: [id])
+
+  billItems BillItem[]
+  stockLogs StockTransaction[]
+  
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopId])
+}
+
+//////////////////////////////////////////////////////
+// BILL TABLE (Customer Invoice)
+//////////////////////////////////////////////////////
+
+model Bill {
+  id            Int    @id @default(autoincrement())
+  shopId        Int
+
+  customerName  String
+  customerPhone String?
+
+  subtotal    Float
+  discount    Float @default(0)
+  totalAmount Float
+  totalReceived Float
+  changeDue Float
+  remainingDue Float @default(0)
+  status String @default("pending") // paid | pending
+
+  shop  Shop @relation(fields: [shopId], references: [id])
+  items BillItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([shopId])
+  @@index([createdAt])
+}
+
+//////////////////////////////////////////////////////
+// BILL ITEMS TABLE (Invoice Product Details)
+//////////////////////////////////////////////////////
+
+model BillItem {
+  id        Int   @id @default(autoincrement())
+  billId    Int
+  productId Int
+
+  productName String
+
+  // 🔥 Item Type
+  stockType String // quantity | area | length
+
+  // -------- Quantity Mode --------
+  quantity Float?  //use for both unitbase items & areabaseditems
+
+  // -------- Area Mode --------
+  unit      String? // cm | feet | inch | meter
+  width     Float?
+  height    Float?
+  unitArea   Float?  // always stored in cm²
+  totalArea   Float?  //multiply unitArea * quantity
+  // -------- Length Mode --------
+  lengthCm  Float?
+
+  // -------- Pricing --------
+  pricePerUnit Float    //use for both unitbase items & areabaseditems
+  total        Float
+
+  bill    Bill    @relation(fields: [billId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([billId])
+  @@index([productId])
+}
+
+//////////////////////////////////////////////////////
+// STOCK TRANSACTION HISTORY (MOST IMPORTANT TABLE ⭐)
+//////////////////////////////////////////////////////
+
+model StockTransaction {
+  id        Int    @id @default(autoincrement())
+
+  shopId    Int
+  productId Int
+
+  type String   // IN or OUT
+
+  quantity Float
+  price    Float?
+
+  description String?
+
+  shop    Shop    @relation(fields: [shopId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([shopId])
+  @@index([productId])
+  @@index([type])
+  @@index([createdAt])
+}
