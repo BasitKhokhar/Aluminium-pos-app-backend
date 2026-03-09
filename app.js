@@ -27,7 +27,7 @@ app.use('/billing', billingRoutes);
 app.use('/stock', stockRoutes);
 app.use('/dashboard', dashboardRoutes);
 
-app.get('/', (req, res) => res.send("Basit's modular backend is live"));
+app.get('/', (req, res) => res.send("Hamdan Glass POS BAckend by Basit Tech Solutions is live"));
 
 
 app.get('/db-status', async (req, res) => {
