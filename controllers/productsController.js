@@ -1,67 +1,92 @@
 const prisma = require('../prisma/client');
 const { convertToCm, calculateAreaCm2, getAreaConversionFactor } = require('../utils/unitConverter');
+const bucketStorage = require('../utils/bucketStorage');
+const multer = require('multer');
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Create a new Product
-exports.createProduct = async (req, res) => {
-    const {
-        shopId,
-        categoryId,
-        name,
-        image,
-        stockType, // unitbased | areabased
-        quantity,
-        purchasePrice,
-        salePrice,
-        unit, // for areabased: feet | meter | inch | cm
-        sheetWidth,
-        sheetHeight,
-        sheetArea
-    } = req.body;
-
-    console.log("📥 Creating product:", req.body);
-
-    try {
-        let data = {
-            shopId: parseInt(shopId),
-            categoryId: categoryId ? parseInt(categoryId) : null,
+exports.createProduct = [
+    upload.single("image"),
+    async (req, res) => {
+        const {
+            shopId,
+            categoryId,
             name,
-            image,
-            purchasePrice: parseFloat(purchasePrice),
-            salePrice: parseFloat(salePrice),
-        };
+            stockType, // unitbased | areabased
+            quantity,
+            purchasePrice,
+            salePrice,
+            unit, // for areabased: feet | meter | inch | cm
+            sheetWidth,
+            sheetHeight,
+        } = req.body;
 
-        if (stockType === 'areabased') {
-            const widthCm = convertToCm(parseFloat(sheetWidth), unit);
-            const heightCm = convertToCm(parseFloat(sheetHeight), unit);
-            const areaCm2 = calculateAreaCm2(parseFloat(sheetWidth), parseFloat(sheetHeight), unit);
-            const areaFactor = getAreaConversionFactor(unit);
+        const file = req.file;
 
-            data.stockType = 'area';
-            data.sheetWidthCm = widthCm;
-            data.sheetHeightCm = heightCm;
-            data.sheetAreaCm2 = areaCm2;
-            data.stockAreaCm2 = areaCm2 * (parseFloat(quantity) || 0);
-            data.stockQuantity = parseFloat(quantity) || 0;
+        console.log("📥 Creating product:", req.body);
+        console.log("📥 Product image file:", file);
 
-            // Adjust prices to smallest unit (cm2) if input unit is not cm
-            if (areaFactor > 1) {
-                data.purchasePrice = parseFloat(purchasePrice) / areaFactor;
-                data.salePrice = parseFloat(salePrice) / areaFactor;
-            }
-        } else {
-            // Default to unitbased/quantity
-            data.stockType = 'quantity';
-            data.stockQuantity = parseFloat(quantity) || 0;
+        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
+            return res.status(400).json({ message: 'Valid shopId is required' });
         }
 
-        const product = await prisma.product.create({ data });
+        try {
+            let imageUrl = req.body.image; // Fallback if image URL is passed as string
 
-        res.status(201).json({ message: 'Product created successfully', product });
-    } catch (err) {
-        console.error('❌ Create Product Error:', err);
-        res.status(500).json({ error: err.message });
+            // 1️⃣ Upload buffer to bucket if a file is provided
+            if (file && file.buffer) {
+                const filename = `products/${Date.now()}_${file.originalname}`;
+                imageUrl = await bucketStorage.uploadImageFromBuffer(
+                    file.buffer,
+                    file.mimetype,
+                    filename
+                );
+            }
+
+            let data = {
+                shopId: parseInt(shopId),
+                categoryId: categoryId && categoryId !== 'undefined' && !isNaN(parseInt(categoryId)) ? parseInt(categoryId) : null,
+                name,
+                image: imageUrl,
+                purchasePrice: parseFloat(purchasePrice),
+                salePrice: parseFloat(salePrice),
+            };
+
+            if (stockType === 'areabased') {
+                const widthCm = convertToCm(parseFloat(sheetWidth), unit);
+                const heightCm = convertToCm(parseFloat(sheetHeight), unit);
+                const areaCm2 = calculateAreaCm2(parseFloat(sheetWidth), parseFloat(sheetHeight), unit);
+                const areaFactor = getAreaConversionFactor(unit);
+
+                data.stockType = 'area';
+                data.sheetWidthCm = widthCm;
+                data.sheetHeightCm = heightCm;
+                data.sheetAreaCm2 = areaCm2;
+                data.stockAreaCm2 = areaCm2 * (parseFloat(quantity) || 0);
+                data.stockQuantity = parseFloat(quantity) || 0;
+
+                // Adjust prices to smallest unit (cm2) if input unit is not cm
+                if (areaFactor > 1) {
+                    data.purchasePrice = parseFloat(purchasePrice) / areaFactor;
+                    data.salePrice = parseFloat(salePrice) / areaFactor;
+                }
+            } else {
+                // Default to unitbased/quantity
+                data.stockType = 'quantity';
+                data.stockQuantity = parseFloat(quantity) || 0;
+            }
+
+            const product = await prisma.product.create({ data });
+
+            res.status(201).json({ message: 'Product created successfully', product });
+        } catch (err) {
+            console.error('❌ Create Product Error:', err);
+            res.status(500).json({ error: err.message });
+        }
     }
-};
+];
+
 
 // Get all products (filtered by shop and optionally category)
 exports.getProducts = async (req, res) => {
@@ -71,7 +96,9 @@ exports.getProducts = async (req, res) => {
         const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
 
-        if (!shopId) return res.status(400).json({ message: 'shopId is required' });
+        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
+            return res.status(400).json({ message: 'Valid shopId is required' });
+        }
 
         const where = { shopId: parseInt(shopId) };
         if (categoryId) where.categoryId = parseInt(categoryId);
@@ -114,7 +141,9 @@ exports.getAllProducts = async (req, res) => {
 
         console.log("📥 Fetching paginated products for shop:", shopId, { page, limit });
 
-        if (!shopId) return res.status(400).json({ message: 'shopId is required' });
+        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
+            return res.status(400).json({ message: 'Valid shopId is required' });
+        }
 
         const where = { shopId: parseInt(shopId) };
 
@@ -168,88 +197,108 @@ exports.getProductById = async (req, res) => {
 };
 
 // Update a product
-exports.updateProduct = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const {
-            categoryId,
-            name,
-            image,
-            stockType,
-            quantity,
-            purchasePrice,
-            salePrice,
-            unit,
-            sheetWidth,
-            sheetHeight
-        } = req.body;
+exports.updateProduct = [
+    upload.single("image"),
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const {
+                categoryId,
+                name,
+                stockType,
+                quantity,
+                purchasePrice,
+                salePrice,
+                unit,
+                sheetWidth,
+                sheetHeight
+            } = req.body;
 
-        const existingProduct = await prisma.product.findUnique({ where: { id: parseInt(id) } });
-        if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
+            const file = req.file;
 
-        const updateData = {
-            name,
-            image,
-            purchasePrice: purchasePrice ? parseFloat(purchasePrice) : undefined,
-            salePrice: salePrice ? parseFloat(salePrice) : undefined,
-        };
+            const existingProduct = await prisma.product.findUnique({ where: { id: parseInt(id) } });
+            if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
 
-        if (categoryId !== undefined) updateData.categoryId = categoryId ? parseInt(categoryId) : null;
+            let imageUrl = req.body.image || existingProduct.image;
 
-        // Handle Stock Updates
-        const currentStockType = stockType || existingProduct.stockType;
-
-        if (currentStockType === 'areabased' || currentStockType === 'area') {
-            updateData.stockType = 'area';
-
-            const sWidth = sheetWidth !== undefined ? parseFloat(sheetWidth) : (existingProduct.sheetWidthCm); // Note: this assumes existing is in CM if we don't have unit
-            const sHeight = sheetHeight !== undefined ? parseFloat(sheetHeight) : (existingProduct.sheetHeightCm);
-
-            if (sheetWidth !== undefined || sheetHeight !== undefined || unit !== undefined) {
-                // If any dimension or unit changed, recalculate CM values
-                const useUnit = unit || 'cm';
-                const widthCm = convertToCm(sWidth, useUnit);
-                const heightCm = convertToCm(sHeight, useUnit);
-                const areaCm2 = calculateAreaCm2(sWidth, sHeight, useUnit);
-                const areaFactor = getAreaConversionFactor(useUnit);
-
-                updateData.sheetWidthCm = widthCm;
-                updateData.sheetHeightCm = heightCm;
-                updateData.sheetAreaCm2 = areaCm2;
-
-                if (purchasePrice !== undefined && areaFactor > 1) {
-                    updateData.purchasePrice = parseFloat(purchasePrice) / areaFactor;
-                }
-                if (salePrice !== undefined && areaFactor > 1) {
-                    updateData.salePrice = parseFloat(salePrice) / areaFactor;
-                }
-
-                if (quantity !== undefined) {
-                    updateData.stockQuantity = parseFloat(quantity);
-                    updateData.stockAreaCm2 = areaCm2 * parseFloat(quantity);
-                } else {
-                    updateData.stockAreaCm2 = areaCm2 * existingProduct.stockQuantity;
-                }
-            } else if (quantity !== undefined) {
-                updateData.stockQuantity = parseFloat(quantity);
-                updateData.stockAreaCm2 = (existingProduct.sheetAreaCm2 || 0) * parseFloat(quantity);
+            // Upload new image if provided
+            if (file && file.buffer) {
+                const filename = `products/${Date.now()}_${file.originalname}`;
+                imageUrl = await bucketStorage.uploadImageFromBuffer(
+                    file.buffer,
+                    file.mimetype,
+                    filename
+                );
             }
-        } else {
-            updateData.stockType = 'quantity';
-            if (quantity !== undefined) updateData.stockQuantity = parseFloat(quantity);
+
+            const updateData = {
+                name,
+                image: imageUrl,
+                purchasePrice: purchasePrice ? parseFloat(purchasePrice) : undefined,
+                salePrice: salePrice ? parseFloat(salePrice) : undefined,
+            };
+
+            if (categoryId !== undefined && categoryId !== 'undefined') {
+                const parsedId = parseInt(categoryId);
+                updateData.categoryId = !isNaN(parsedId) ? parsedId : null;
+            }
+
+            // Handle Stock Updates
+            const currentStockType = stockType || existingProduct.stockType;
+
+            if (currentStockType === 'areabased' || currentStockType === 'area') {
+                updateData.stockType = 'area';
+
+                const sWidth = sheetWidth !== undefined ? parseFloat(sheetWidth) : (existingProduct.sheetWidthCm); // Note: this assumes existing is in CM if we don't have unit
+                const sHeight = sheetHeight !== undefined ? parseFloat(sheetHeight) : (existingProduct.sheetHeightCm);
+
+                if (sheetWidth !== undefined || sheetHeight !== undefined || unit !== undefined) {
+                    // If any dimension or unit changed, recalculate CM values
+                    const useUnit = unit || 'cm';
+                    const widthCm = convertToCm(sWidth, useUnit);
+                    const heightCm = convertToCm(sHeight, useUnit);
+                    const areaCm2 = calculateAreaCm2(sWidth, sHeight, useUnit);
+                    const areaFactor = getAreaConversionFactor(useUnit);
+
+                    updateData.sheetWidthCm = widthCm;
+                    updateData.sheetHeightCm = heightCm;
+                    updateData.sheetAreaCm2 = areaCm2;
+
+                    if (purchasePrice !== undefined && areaFactor > 1) {
+                        updateData.purchasePrice = parseFloat(purchasePrice) / areaFactor;
+                    }
+                    if (salePrice !== undefined && areaFactor > 1) {
+                        updateData.salePrice = parseFloat(salePrice) / areaFactor;
+                    }
+
+                    if (quantity !== undefined) {
+                        updateData.stockQuantity = parseFloat(quantity);
+                        updateData.stockAreaCm2 = areaCm2 * parseFloat(quantity);
+                    } else {
+                        updateData.stockAreaCm2 = areaCm2 * existingProduct.stockQuantity;
+                    }
+                } else if (quantity !== undefined) {
+                    updateData.stockQuantity = parseFloat(quantity);
+                    updateData.stockAreaCm2 = (existingProduct.sheetAreaCm2 || 0) * parseFloat(quantity);
+                }
+            } else {
+                updateData.stockType = 'quantity';
+                if (quantity !== undefined) updateData.stockQuantity = parseFloat(quantity);
+            }
+
+            const product = await prisma.product.update({
+                where: { id: parseInt(id) },
+                data: updateData,
+            });
+
+            res.json({ message: 'Product updated successfully', product });
+        } catch (err) {
+            console.error('Update Product Error:', err);
+            res.status(500).json({ error: err.message });
         }
-
-        const product = await prisma.product.update({
-            where: { id: parseInt(id) },
-            data: updateData,
-        });
-
-        res.json({ message: 'Product updated successfully', product });
-    } catch (err) {
-        console.error('Update Product Error:', err);
-        res.status(500).json({ error: err.message });
     }
-};
+];
+
 
 // Delete a product
 exports.deleteProduct = async (req, res) => {
@@ -277,8 +326,8 @@ exports.searchProducts = async (req, res) => {
             return res.status(400).json({ message: "Search query is required" });
         }
 
-        if (!shopId) {
-            return res.status(400).json({ message: "shopId is required" });
+        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
+            return res.status(400).json({ message: "Valid shopId is required" });
         }
 
         const skip = (parseInt(page) - 1) * parseInt(limit);

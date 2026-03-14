@@ -1,28 +1,59 @@
 const prisma = require('../prisma/client');
+const bucketStorage = require('../utils/bucketStorage');
+const multer = require('multer');
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Create a new Shop
-exports.createShop = async (req, res) => {
-    try {
-        const { name, address, phone, logo } = req.body;
-        console.log("data in create shop ", name, address, phone, logo)
-        const adminId = req.admin.id; // From verifyAdminToken middleware
+exports.createShop = [
+    upload.single("logo"),
+    async (req, res) => {
+        try {
+            const { name, address, phone } = req.body;
+            const file = req.file;
 
-        const shop = await prisma.shop.create({
-            data: {
+            console.log("📥 Creating shop:", name, address, phone);
+            console.log("📥 Shop logo file:", file);
+
+            const adminId = req.admin.id; // From verifyAdminToken middleware
+
+            let logoUrl = req.body.logo;
+
+            // Upload logo if provided
+            if (file && file.buffer) {
+                // Remove folder prefix since 'HamdanPOS' is already in .env paths.
+                // This ensures images go directly into /ImagesBucket/HamdanPOS/
+                const filename = `${Date.now()}_${file.originalname}`;
+                logoUrl = await bucketStorage.uploadImageFromBuffer(
+                    file.buffer,
+                    file.mimetype,
+                    filename
+                );
+            }
+            console.log("payload sendign to create shop:", {
                 name,
                 address,
                 phone,
-                logo,
+                logo: logoUrl,
                 adminId,
-            },
-        });
+            });
+            const shop = await prisma.shop.create({
+                data: {
+                    name,
+                    address,
+                    phone,
+                    logo: logoUrl,
+                    adminId,
+                },
+            });
 
-        res.status(201).json({ message: 'Shop created successfully', shop, id: shop.id });
-    } catch (err) {
-        console.error('Create Shop Error:', err);
-        res.status(500).json({ error: err.message });
+            res.status(201).json({ message: 'Shop created successfully', shop, id: shop.id });
+        } catch (err) {
+            console.error('Create Shop Error:', err);
+            res.status(500).json({ error: err.message });
+        }
     }
-};
+];
 
 // Get all shops for the logged-in admin
 exports.getShops = async (req, res) => {
@@ -72,28 +103,45 @@ exports.getShopById = async (req, res) => {
 };
 
 // Update a shop
-exports.updateShop = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { name, address, phone, logo } = req.body;
-        const adminId = req.admin.id;
+exports.updateShop = [
+    upload.single("logo"),
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { name, address, phone } = req.body;
+            const file = req.file;
+            const adminId = req.admin.id;
 
-        const shop = await prisma.shop.updateMany({
-            where: {
-                id: parseInt(id),
-                adminId: adminId,
-            },
-            data: { name, address, phone, logo },
-        });
+            const existingShop = await prisma.shop.findFirst({
+                where: { id: parseInt(id), adminId }
+            });
 
-        if (shop.count === 0) return res.status(404).json({ message: 'Shop not found or unauthorized' });
+            if (!existingShop) return res.status(404).json({ message: 'Shop not found or unauthorized' });
 
-        res.json({ message: 'Shop updated successfully' });
-    } catch (err) {
-        console.error('Update Shop Error:', err);
-        res.status(500).json({ error: err.message });
+            let logoUrl = req.body.logo || existingShop.logo;
+
+            // Upload new logo if provided
+            if (file && file.buffer) {
+                const filename = `${Date.now()}_${file.originalname}`;
+                logoUrl = await bucketStorage.uploadImageFromBuffer(
+                    file.buffer,
+                    file.mimetype,
+                    filename
+                );
+            }
+
+            const shop = await prisma.shop.update({
+                where: { id: parseInt(id) },
+                data: { name, address, phone, logo: logoUrl },
+            });
+
+            res.json({ message: 'Shop updated successfully', shop });
+        } catch (err) {
+            console.error('Update Shop Error:', err);
+            res.status(500).json({ error: err.message });
+        }
     }
-};
+];
 
 // Delete a shop
 exports.deleteShop = async (req, res) => {
@@ -118,3 +166,4 @@ exports.deleteShop = async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 };
+
