@@ -36,7 +36,7 @@ exports.createProduct = [
 
             // 1️⃣ Upload buffer to bucket if a file is provided
             if (file && file.buffer) {
-                const filename = `products/${Date.now()}_${file.originalname}`;
+                const filename = `${Date.now()}_${file.originalname}`;
                 imageUrl = await bucketStorage.uploadImageFromBuffer(
                     file.buffer,
                     file.mimetype,
@@ -223,7 +223,7 @@ exports.updateProduct = [
 
             // Upload new image if provided
             if (file && file.buffer) {
-                const filename = `products/${Date.now()}_${file.originalname}`;
+                const filename = `${Date.now()}_${file.originalname}`;
                 imageUrl = await bucketStorage.uploadImageFromBuffer(
                     file.buffer,
                     file.mimetype,

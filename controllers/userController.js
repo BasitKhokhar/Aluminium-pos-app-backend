@@ -74,26 +74,54 @@ exports.getUser = async (req, res) => {
     res.status(500).json({ error: 'Database error' });
   }
 };
-exports.updateUser = async (req, res) => {
-  const userId = parseInt(req.user?.id);
-  const { name, email, phone } = req.body;
+exports.updateUser = [
+  upload.single("image"),
+  async (req, res) => {
+    const userId = parseInt(req.user?.id);
+    const { name, email, phone } = req.body;
+    const file = req.file;
 
-  if (!userId) {
-    return res.status(401).json({ message: "Unauthorized" });
-  }
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-  try {
-    await prisma.users.update({
-      where: { user_id: userId },
-      data: { name, email, phone },
-    });
+    try {
+      // Fetch existing profile image so we can fall back to it if no new file is sent
+      const existingImage = await prisma.userimages.findUnique({
+        where: { user_id: userId },
+      });
 
-    res.json({ message: "User updated successfully" });
-  } catch (err) {
-    console.error("❌ Update user error:", err);
-    res.status(500).json({ error: "Database error" });
-  }
-};
+      let imageUrl = req.body.image || existingImage?.image_url || null;
+
+      // Upload new profile image if provided
+      if (file && file.buffer) {
+        const filename = `${userId}_${Date.now()}_${file.originalname}`;
+        imageUrl = await bucketStorage.uploadImageFromBuffer(
+          file.buffer,
+          file.mimetype,
+          filename
+        );
+
+        // Upsert the image record in userimages table
+        await prisma.userimages.upsert({
+          where: { user_id: userId },
+          update: { image_url: imageUrl },
+          create: { user_id: userId, image_url: imageUrl },
+        });
+      }
+
+      await prisma.users.update({
+        where: { user_id: userId },
+        data: { name, email, phone },
+      });
+
+      res.json({ message: "User updated successfully", imageUrl });
+    } catch (err) {
+      console.error("❌ Update user error:", err);
+      res.status(500).json({ error: "Database error" });
+    }
+  },
+];
 
 // Get User's Profile Image
 exports.getUserImage = async (req, res) => {

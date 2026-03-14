@@ -23,7 +23,7 @@ exports.createCategory = [
 
             // Upload image if provided
             if (file && file.buffer) {
-                const filename = `categories/${Date.now()}_${file.originalname}`;
+                const filename = `${Date.now()}_${file.originalname}`;
                 imageUrl = await bucketStorage.uploadImageFromBuffer(
                     file.buffer,
                     file.mimetype,
@@ -109,7 +109,7 @@ exports.updateCategory = [
 
             // Upload new image if provided
             if (file && file.buffer) {
-                const filename = `categories/${Date.now()}_${file.originalname}`;
+                const filename = `${Date.now()}_${file.originalname}`;
                 imageUrl = await bucketStorage.uploadImageFromBuffer(
                     file.buffer,
                     file.mimetype,
