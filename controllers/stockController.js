@@ -68,3 +68,53 @@ exports.getStockLogs = async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 };
+
+// Get specific product stock-in detail with date range
+exports.getProductStockInDetails = async (req, res) => {
+    try {
+        const { productId, startDate, endDate, type = 'IN' } = req.query;
+
+        if (!productId || !startDate || !endDate) {
+            return res.status(400).json({ message: 'productId, startDate, and endDate are required' });
+        }
+
+        const where = {
+            productId: parseInt(productId),
+        };
+
+        // 🟢 TYPE FILTER (IN, OUT, or all)
+        if (type !== 'all') {
+            where.type = type; // IN or OUT
+        }
+
+        // 📅 DATE RANGE FILTER
+        if (startDate && endDate) {
+            where.createdAt = {
+                gte: new Date(startDate + "T00:00:00.000Z"),
+                lte: new Date(endDate + "T23:59:59.999Z"),
+            };
+        }
+
+        const logs = await prisma.stockTransaction.findMany({
+            where,
+            include: {
+                product: {
+                    select: {
+                        name: true,
+                        purchasePrice: true,
+                        salePrice: true
+                    }
+                }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        res.json({
+            success: true,
+            logs
+        });
+    } catch (err) {
+        console.error('Get Product Stock In Details Error:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+};

@@ -36,6 +36,15 @@ exports.createBill = async (req, res) => {
                 const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
                 const total = parseFloat(item.total) || (quantity * pricePerUnit);
 
+                // Fetch product details for accurate sheet quantity calculation
+                const product = await tx.product.findUnique({ where: { id: productId } });
+                if (!product) throw new Error(`Product with ID ${productId} not found`);
+
+                let sheetsUsed = quantity;
+                if (item.stockType === 'area' && product.sheetAreaCm2) {
+                    sheetsUsed = (parseFloat(item.totalArea) || 0) / product.sheetAreaCm2;
+                }
+
                 // Create BillItem
                 const billItem = await tx.billItem.create({
                     data: {
@@ -60,6 +69,8 @@ exports.createBill = async (req, res) => {
                 const updateData = {};
                 if (item.stockType === 'area') {
                     updateData.stockAreaCm2 = { decrement: parseFloat(item.totalArea) || 0 };
+                    // 🔥 Sync sheet count (stockQuantity) for area-based items
+                    updateData.stockQuantity = { decrement: sheetsUsed };
                 } else if (item.stockType === 'length') {
                     updateData.stockLengthCm = { decrement: parseFloat(item.lengthCm) || 0 };
                 } else {
@@ -77,7 +88,7 @@ exports.createBill = async (req, res) => {
                         shopId: parseInt(shopId),
                         productId: productId,
                         type: 'OUT',
-                        quantity,
+                        quantity: sheetsUsed, // 🔥 Log value in sheets
                         price: pricePerUnit,
                         description: `Sold in Bill #${bill.id}`,
                     },
@@ -238,10 +249,21 @@ exports.updateBill = async (req, res) => {
 
             // 2. Revert Old Items (Stock and Transactions)
             for (const oldItem of existingBill.items) {
+                const product = await tx.product.findUnique({ where: { id: oldItem.productId } });
+                
                 // Return stock based on stockType
                 const revertData = {};
+                let revertQuantity = oldItem.quantity || 0;
+
                 if (oldItem.stockType === 'area') {
-                    revertData.stockAreaCm2 = { increment: parseFloat(oldItem.totalArea) || 0 };
+                    const totalArea = parseFloat(oldItem.totalArea) || 0;
+                    revertData.stockAreaCm2 = { increment: totalArea };
+                    
+                    // 🔥 Calculate original sheets used to revert sheet count
+                    if (product && product.sheetAreaCm2) {
+                        revertQuantity = totalArea / product.sheetAreaCm2;
+                    }
+                    revertData.stockQuantity = { increment: revertQuantity };
                 } else if (oldItem.stockType === 'length') {
                     revertData.stockLengthCm = { increment: parseFloat(oldItem.lengthCm) || 0 };
                 } else {
@@ -259,8 +281,8 @@ exports.updateBill = async (req, res) => {
                         shopId: existingBill.shopId,
                         productId: oldItem.productId,
                         type: 'IN', // Reversing the previous sale
-                        quantity: oldItem.quantity,
-                        price: oldItem.pricePerUnit || oldItem.price, // handle both old and new field names
+                        quantity: revertQuantity, // 🔥 In sheets
+                        price: oldItem.pricePerUnit || oldItem.price,
                         description: `Reverted for Bill Update #${existingBill.id}`,
                     },
                 });
@@ -310,6 +332,15 @@ exports.updateBill = async (req, res) => {
                 const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
                 const total = parseFloat(item.total) || (quantity * pricePerUnit);
 
+                // Fetch product for accurate quantity tracking
+                const product = await tx.product.findUnique({ where: { id: productId } });
+                if (!product) throw new Error(`Product with ID ${productId} not found`);
+
+                let sheetsUsed = quantity;
+                if (item.stockType === 'area' && product.sheetAreaCm2) {
+                    sheetsUsed = (parseFloat(item.totalArea) || 0) / product.sheetAreaCm2;
+                }
+
                 // Create BillItem
                 const billItem = await tx.billItem.create({
                     data: {
@@ -334,6 +365,7 @@ exports.updateBill = async (req, res) => {
                 const updateData = {};
                 if (item.stockType === 'area') {
                     updateData.stockAreaCm2 = { decrement: parseFloat(item.totalArea) || 0 };
+                    updateData.stockQuantity = { decrement: sheetsUsed }; // 🔥 Sync sheet count
                 } else if (item.stockType === 'length') {
                     updateData.stockLengthCm = { decrement: parseFloat(item.lengthCm) || 0 };
                 } else {
@@ -351,7 +383,7 @@ exports.updateBill = async (req, res) => {
                         shopId: parseInt(shopId),
                         productId: productId,
                         type: 'OUT',
-                        quantity,
+                        quantity: sheetsUsed, // 🔥 Value in sheets
                         price: pricePerUnit,
                         description: `Sold in Updated Bill #${updatedBill.id}`,
                     },

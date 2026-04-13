@@ -77,9 +77,27 @@ exports.createProduct = [
                 data.stockQuantity = parseFloat(quantity) || 0;
             }
 
-            const product = await prisma.product.create({ data });
+            const result = await prisma.$transaction(async (tx) => {
+                const product = await tx.product.create({ data });
 
-            res.status(201).json({ message: 'Product created successfully', product });
+                // 2️⃣ Log initial stock as a transaction if quantity > 0
+                if (parseFloat(quantity) > 0) {
+                    await tx.stockTransaction.create({
+                        data: {
+                            shopId: parseInt(shopId),
+                            productId: product.id,
+                            type: 'IN',
+                            quantity: parseFloat(quantity),
+                            price: parseFloat(purchasePrice),
+                            description: 'Initial stock on product creation',
+                        },
+                    });
+                }
+
+                return product;
+            });
+
+            res.status(201).json({ message: 'Product created successfully', product: result });
         } catch (err) {
             console.error('❌ Create Product Error:', err);
             res.status(500).json({ error: err.message });
@@ -286,12 +304,36 @@ exports.updateProduct = [
                 if (quantity !== undefined) updateData.stockQuantity = parseFloat(quantity);
             }
 
-            const product = await prisma.product.update({
-                where: { id: parseInt(id) },
-                data: updateData,
+            const result = await prisma.$transaction(async (tx) => {
+                const product = await tx.product.update({
+                    where: { id: parseInt(id) },
+                    data: updateData,
+                });
+
+                // 2️⃣ Log stock transaction if quantity changed via edit
+                if (quantity !== undefined) {
+                    const newQuantity = parseFloat(quantity);
+                    const oldQuantity = existingProduct.stockQuantity;
+                    const diff = newQuantity - oldQuantity;
+
+                    if (diff !== 0) {
+                        await tx.stockTransaction.create({
+                            data: {
+                                shopId: existingProduct.shopId,
+                                productId: product.id,
+                                type: diff > 0 ? 'IN' : 'OUT',
+                                quantity: Math.abs(diff),
+                                price: purchasePrice ? parseFloat(purchasePrice) : existingProduct.purchasePrice,
+                                description: 'Stock updated via product edit',
+                            },
+                        });
+                    }
+                }
+
+                return product;
             });
 
-            res.json({ message: 'Product updated successfully', product });
+            res.json({ message: 'Product updated successfully', product: result });
         } catch (err) {
             console.error('Update Product Error:', err);
             res.status(500).json({ error: err.message });
