@@ -1,51 +1,43 @@
 const prisma = require('../prisma/client');
-const { convertToCm, calculateAreaCm2, getAreaConversionFactor } = require('../utils/unitConverter');
+const { convertToCm, calculateAreaCm2, getAreaConversionFactor, getLengthConversionFactor } = require('../utils/unitConverter');
 const bucketStorage = require('../utils/bucketStorage');
-const multer = require('multer');
-
-const upload = multer({ storage: multer.memoryStorage() });
+const { normalizeStockType } = require('../utils/stockType');
 
 // Create a new Product
-exports.createProduct = [
-    upload.single("image"),
-    async (req, res) => {
+// Note: multer (`upload.single('image')`) is applied in the route file, BEFORE
+// tenantContext — tenantContext reads req.body.shopId, which multer must have
+// already parsed off the multipart body for that to be populated.
+exports.createProduct = async (req, res) => {
         const {
-            shopId,
             categoryId,
             name,
-            stockType, // unitbased | areabased
+            stockType,
             quantity,
             purchasePrice,
             salePrice,
-            unit, // for areabased: feet | meter | inch | cm
+            unit, // for area/length: feet | meter | inch | cm
             sheetWidth,
             sheetHeight,
+            packSize,
+            packPurchasePrice,
+            packSalePrice,
+            stockPacks,
+            stockLooseUnits,
         } = req.body;
 
+        const shopId = req.tenant.shopId;
         const file = req.file;
 
-        console.log("📥 Creating product:", req.body);
-        console.log("📥 Product image file:", file);
-
-        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
-            return res.status(400).json({ message: 'Valid shopId is required' });
-        }
-
         try {
-            let imageUrl = req.body.image; // Fallback if image URL is passed as string
+            let imageUrl = req.body.image;
 
-            // 1️⃣ Upload buffer to bucket if a file is provided
             if (file && file.buffer) {
                 const filename = `${Date.now()}_${file.originalname}`;
-                imageUrl = await bucketStorage.uploadImageFromBuffer(
-                    file.buffer,
-                    file.mimetype,
-                    filename
-                );
+                imageUrl = await bucketStorage.uploadImageFromBuffer(file.buffer, file.mimetype, filename);
             }
 
             let data = {
-                shopId: parseInt(shopId),
+                shopId,
                 categoryId: categoryId && categoryId !== 'undefined' && !isNaN(parseInt(categoryId)) ? parseInt(categoryId) : null,
                 name,
                 image: imageUrl,
@@ -53,41 +45,57 @@ exports.createProduct = [
                 salePrice: parseFloat(salePrice),
             };
 
-            if (stockType === 'areabased') {
+            const normalizedType = normalizeStockType(stockType);
+            data.stockType = normalizedType;
+
+            if (normalizedType === 'AREA') {
                 const widthCm = convertToCm(parseFloat(sheetWidth), unit);
                 const heightCm = convertToCm(parseFloat(sheetHeight), unit);
                 const areaCm2 = calculateAreaCm2(parseFloat(sheetWidth), parseFloat(sheetHeight), unit);
                 const areaFactor = getAreaConversionFactor(unit);
 
-                data.stockType = 'area';
                 data.sheetWidthCm = widthCm;
                 data.sheetHeightCm = heightCm;
                 data.sheetAreaCm2 = areaCm2;
                 data.stockAreaCm2 = areaCm2 * (parseFloat(quantity) || 0);
                 data.stockQuantity = parseFloat(quantity) || 0;
 
-                // Adjust prices to smallest unit (cm2) if input unit is not cm
                 if (areaFactor > 1) {
                     data.purchasePrice = parseFloat(purchasePrice) / areaFactor;
                     data.salePrice = parseFloat(salePrice) / areaFactor;
                 }
+            } else if (normalizedType === 'LENGTH') {
+                const lengthFactor = getLengthConversionFactor(unit);
+                data.stockLengthCm = convertToCm(parseFloat(quantity) || 0, unit);
+
+                if (lengthFactor > 1) {
+                    data.purchasePrice = parseFloat(purchasePrice) / lengthFactor;
+                    data.salePrice = parseFloat(salePrice) / lengthFactor;
+                }
+            } else if (normalizedType === 'PACK') {
+                data.packSize = parseInt(packSize) || null;
+                data.stockPacks = parseFloat(stockPacks) || 0;
+                data.stockLooseUnits = parseFloat(stockLooseUnits) || 0;
+                data.packPurchasePrice = packPurchasePrice ? parseFloat(packPurchasePrice) : null;
+                data.packSalePrice = packSalePrice ? parseFloat(packSalePrice) : null;
             } else {
-                // Default to unitbased/quantity
-                data.stockType = 'quantity';
                 data.stockQuantity = parseFloat(quantity) || 0;
             }
 
             const result = await prisma.$transaction(async (tx) => {
                 const product = await tx.product.create({ data });
 
-                // 2️⃣ Log initial stock as a transaction if quantity > 0
-                if (parseFloat(quantity) > 0) {
+                const initialQty = normalizedType === 'PACK'
+                    ? (parseFloat(stockPacks) || 0) * (parseInt(packSize) || 1) + (parseFloat(stockLooseUnits) || 0)
+                    : parseFloat(quantity) || 0;
+
+                if (initialQty > 0) {
                     await tx.stockTransaction.create({
                         data: {
-                            shopId: parseInt(shopId),
+                            shopId,
                             productId: product.id,
                             type: 'IN',
-                            quantity: parseFloat(quantity),
+                            quantity: initialQty,
                             price: parseFloat(purchasePrice),
                             description: 'Initial stock on product creation',
                         },
@@ -102,31 +110,23 @@ exports.createProduct = [
             console.error('❌ Create Product Error:', err);
             res.status(500).json({ error: err.message });
         }
-    }
-];
-
+};
 
 // Get all products (filtered by shop and optionally category)
 exports.getProducts = async (req, res) => {
     try {
-        const { shopId, categoryId } = req.query;
+        const { categoryId } = req.query;
+        const shopId = req.tenant.shopId;
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
 
-        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
-            return res.status(400).json({ message: 'Valid shopId is required' });
-        }
-
-        const where = { shopId: parseInt(shopId) };
+        const where = { shopId, isDeleted: false };
         if (categoryId) where.categoryId = parseInt(categoryId);
 
-        // Fetch paginated products
         const products = await prisma.product.findMany({
             where,
-            include: {
-                category: true,
-            },
+            include: { category: true },
             orderBy: { createdAt: 'desc' },
             skip,
             take: limit,
@@ -135,75 +135,47 @@ exports.getProducts = async (req, res) => {
         const total = await prisma.product.count({ where });
         const hasMore = skip + limit < total;
 
-        res.json({
-            success: true,
-            products,
-            total,
-            page,
-            limit,
-            hasMore,
-        });
+        res.json({ success: true, products, total, page, limit, hasMore });
     } catch (err) {
         console.error('Get Products Error:', err);
         res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 };
 
-// Get all products (filtered by shop)
+// Get all products (filtered by shop) — legacy paginated-by-route-param variant
 exports.getAllProducts = async (req, res) => {
     try {
-        const { shopId } = req.params;
+        const shopId = req.tenant.shopId;
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
 
-        console.log("📥 Fetching paginated products for shop:", shopId, { page, limit });
+        const where = { shopId, isDeleted: false };
 
-        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
-            return res.status(400).json({ message: 'Valid shopId is required' });
-        }
-
-        const where = { shopId: parseInt(shopId) };
-
-        // Fetch paginated products
         const products = await prisma.product.findMany({
             where,
-            include: {
-                category: true,
-            },
+            include: { category: true },
             orderBy: { createdAt: 'desc' },
             skip,
             take: limit,
         });
 
-        // Total product count for this shop
         const total = await prisma.product.count({ where });
-
         const hasMore = skip + limit < total;
 
-        res.json({
-            success: true,
-            products,
-            total,
-            page,
-            limit,
-            hasMore,
-        });
+        res.json({ success: true, products, total, page, limit, hasMore });
     } catch (err) {
         console.error('❌ Error fetching products:', err);
         res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 };
-// Get single product by ID
+
+// Get single product by ID (ownership resolved by middleware.tenantContext.byResourceId)
 exports.getProductById = async (req, res) => {
     try {
-        const { id } = req.params;
-        const product = await prisma.product.findUnique({
-            where: { id: parseInt(id) },
-            include: {
-                category: true,
-                shop: true
-            }
+        const product = await prisma.product.findFirst({
+            where: { id: parseInt(req.params.id), shopId: req.tenant.shopId },
+            include: { category: true, shop: true },
         });
 
         if (!product) return res.status(404).json({ message: 'Product not found' });
@@ -215,11 +187,10 @@ exports.getProductById = async (req, res) => {
 };
 
 // Update a product
-exports.updateProduct = [
-    upload.single("image"),
-    async (req, res) => {
+exports.updateProduct = async (req, res) => {
         try {
-            const { id } = req.params;
+            const productId = parseInt(req.params.id);
+            const shopId = req.tenant.shopId;
             const {
                 categoryId,
                 name,
@@ -229,24 +200,24 @@ exports.updateProduct = [
                 salePrice,
                 unit,
                 sheetWidth,
-                sheetHeight
+                sheetHeight,
+                packSize,
+                packPurchasePrice,
+                packSalePrice,
+                stockPacks,
+                stockLooseUnits,
             } = req.body;
 
             const file = req.file;
 
-            const existingProduct = await prisma.product.findUnique({ where: { id: parseInt(id) } });
+            const existingProduct = await prisma.product.findFirst({ where: { id: productId, shopId } });
             if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
 
             let imageUrl = req.body.image || existingProduct.image;
 
-            // Upload new image if provided
             if (file && file.buffer) {
                 const filename = `${Date.now()}_${file.originalname}`;
-                imageUrl = await bucketStorage.uploadImageFromBuffer(
-                    file.buffer,
-                    file.mimetype,
-                    filename
-                );
+                imageUrl = await bucketStorage.uploadImageFromBuffer(file.buffer, file.mimetype, filename);
             }
 
             const updateData = {
@@ -261,17 +232,17 @@ exports.updateProduct = [
                 updateData.categoryId = !isNaN(parsedId) ? parsedId : null;
             }
 
-            // Handle Stock Updates
-            const currentStockType = stockType || existingProduct.stockType;
+            const currentType = stockType ? normalizeStockType(stockType) : existingProduct.stockType;
+            updateData.stockType = currentType;
 
-            if (currentStockType === 'areabased' || currentStockType === 'area') {
-                updateData.stockType = 'area';
+            let stockLogQty = 0;
+            let stockLogDirection = 0;
 
-                const sWidth = sheetWidth !== undefined ? parseFloat(sheetWidth) : (existingProduct.sheetWidthCm); // Note: this assumes existing is in CM if we don't have unit
-                const sHeight = sheetHeight !== undefined ? parseFloat(sheetHeight) : (existingProduct.sheetHeightCm);
+            if (currentType === 'AREA') {
+                const sWidth = sheetWidth !== undefined ? parseFloat(sheetWidth) : existingProduct.sheetWidthCm;
+                const sHeight = sheetHeight !== undefined ? parseFloat(sheetHeight) : existingProduct.sheetHeightCm;
 
                 if (sheetWidth !== undefined || sheetHeight !== undefined || unit !== undefined) {
-                    // If any dimension or unit changed, recalculate CM values
                     const useUnit = unit || 'cm';
                     const widthCm = convertToCm(sWidth, useUnit);
                     const heightCm = convertToCm(sHeight, useUnit);
@@ -282,12 +253,8 @@ exports.updateProduct = [
                     updateData.sheetHeightCm = heightCm;
                     updateData.sheetAreaCm2 = areaCm2;
 
-                    if (purchasePrice !== undefined && areaFactor > 1) {
-                        updateData.purchasePrice = parseFloat(purchasePrice) / areaFactor;
-                    }
-                    if (salePrice !== undefined && areaFactor > 1) {
-                        updateData.salePrice = parseFloat(salePrice) / areaFactor;
-                    }
+                    if (purchasePrice !== undefined && areaFactor > 1) updateData.purchasePrice = parseFloat(purchasePrice) / areaFactor;
+                    if (salePrice !== undefined && areaFactor > 1) updateData.salePrice = parseFloat(salePrice) / areaFactor;
 
                     if (quantity !== undefined) {
                         updateData.stockQuantity = parseFloat(quantity);
@@ -299,35 +266,53 @@ exports.updateProduct = [
                     updateData.stockQuantity = parseFloat(quantity);
                     updateData.stockAreaCm2 = (existingProduct.sheetAreaCm2 || 0) * parseFloat(quantity);
                 }
+
+                if (quantity !== undefined) {
+                    const diff = parseFloat(quantity) - existingProduct.stockQuantity;
+                    stockLogQty = Math.abs(diff);
+                    stockLogDirection = diff;
+                }
+            } else if (currentType === 'LENGTH') {
+                const lengthFactor = getLengthConversionFactor(unit || 'cm');
+                if (purchasePrice !== undefined && lengthFactor > 1) updateData.purchasePrice = parseFloat(purchasePrice) / lengthFactor;
+                if (salePrice !== undefined && lengthFactor > 1) updateData.salePrice = parseFloat(salePrice) / lengthFactor;
+
+                if (quantity !== undefined) {
+                    const newLengthCm = convertToCm(parseFloat(quantity), unit || 'cm');
+                    updateData.stockLengthCm = newLengthCm;
+                    const diff = newLengthCm - existingProduct.stockLengthCm;
+                    stockLogQty = Math.abs(diff);
+                    stockLogDirection = diff;
+                }
+            } else if (currentType === 'PACK') {
+                if (packSize !== undefined) updateData.packSize = parseInt(packSize) || null;
+                if (packPurchasePrice !== undefined) updateData.packPurchasePrice = packPurchasePrice ? parseFloat(packPurchasePrice) : null;
+                if (packSalePrice !== undefined) updateData.packSalePrice = packSalePrice ? parseFloat(packSalePrice) : null;
+                if (stockPacks !== undefined) updateData.stockPacks = parseFloat(stockPacks);
+                if (stockLooseUnits !== undefined) updateData.stockLooseUnits = parseFloat(stockLooseUnits);
             } else {
-                updateData.stockType = 'quantity';
-                if (quantity !== undefined) updateData.stockQuantity = parseFloat(quantity);
+                if (quantity !== undefined) {
+                    updateData.stockQuantity = parseFloat(quantity);
+                    const diff = parseFloat(quantity) - existingProduct.stockQuantity;
+                    stockLogQty = Math.abs(diff);
+                    stockLogDirection = diff;
+                }
             }
 
             const result = await prisma.$transaction(async (tx) => {
-                const product = await tx.product.update({
-                    where: { id: parseInt(id) },
-                    data: updateData,
-                });
+                const product = await tx.product.update({ where: { id: productId, shopId }, data: updateData });
 
-                // 2️⃣ Log stock transaction if quantity changed via edit
-                if (quantity !== undefined) {
-                    const newQuantity = parseFloat(quantity);
-                    const oldQuantity = existingProduct.stockQuantity;
-                    const diff = newQuantity - oldQuantity;
-
-                    if (diff !== 0) {
-                        await tx.stockTransaction.create({
-                            data: {
-                                shopId: existingProduct.shopId,
-                                productId: product.id,
-                                type: diff > 0 ? 'IN' : 'OUT',
-                                quantity: Math.abs(diff),
-                                price: purchasePrice ? parseFloat(purchasePrice) : existingProduct.purchasePrice,
-                                description: 'Stock updated via product edit',
-                            },
-                        });
-                    }
+                if (stockLogQty !== 0) {
+                    await tx.stockTransaction.create({
+                        data: {
+                            shopId,
+                            productId: product.id,
+                            type: stockLogDirection > 0 ? 'IN' : 'OUT',
+                            quantity: stockLogQty,
+                            price: purchasePrice ? parseFloat(purchasePrice) : existingProduct.purchasePrice,
+                            description: 'Stock updated via product edit',
+                        },
+                    });
                 }
 
                 return product;
@@ -338,17 +323,21 @@ exports.updateProduct = [
             console.error('Update Product Error:', err);
             res.status(500).json({ error: err.message });
         }
-    }
-];
+};
 
-
-// Delete a product
+// Soft-delete a product — hard delete would throw once the product has ever
+// been sold/stock-logged (FK RESTRICT), and a tombstone is required for sync.
 exports.deleteProduct = async (req, res) => {
     try {
-        const { id } = req.params;
+        const productId = parseInt(req.params.id);
+        const shopId = req.tenant.shopId;
 
-        await prisma.product.delete({
-            where: { id: parseInt(id) },
+        const existing = await prisma.product.findFirst({ where: { id: productId, shopId } });
+        if (!existing) return res.status(404).json({ message: 'Product not found' });
+
+        await prisma.product.update({
+            where: { id: productId, shopId },
+            data: { isDeleted: true, deletedAt: new Date() },
         });
 
         res.json({ message: 'Product deleted successfully' });
@@ -361,44 +350,30 @@ exports.deleteProduct = async (req, res) => {
 // Search products by name within a shop
 exports.searchProducts = async (req, res) => {
     try {
-        const { q, shopId, page, limit } = req.query;
-        console.log("🔍 Incoming product search query:", q, "for shop:", shopId);
+        const { q, page, limit } = req.query;
+        const shopId = req.tenant.shopId;
 
-        if (!q || q.trim() === "") {
-            return res.status(400).json({ message: "Search query is required" });
-        }
-
-        if (!shopId || shopId === 'undefined' || isNaN(parseInt(shopId))) {
-            return res.status(400).json({ message: "Valid shopId is required" });
+        if (!q || q.trim() === '') {
+            return res.status(400).json({ message: 'Search query is required' });
         }
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         const where = {
-            shopId: parseInt(shopId),
-            name: {
-                contains: q,
-                // mode: 'insensitive' // Prisma supports this for MySQL if using a recent version and provider
-            }
+            shopId,
+            isDeleted: false,
+            name: { contains: q },
         };
-
-        // Note: For MySQL, 'contains' is case-insensitive by default with most collations.
-        // If case-sensitivity is an issue, we can use raw queries as in the example provided by the user.
-        // However, findMany is cleaner if it works.
 
         const products = await prisma.product.findMany({
             where,
-            include: {
-                category: true,
-            },
+            include: { category: true },
             orderBy: { createdAt: 'desc' },
             skip,
             take: parseInt(limit),
         });
 
         const total = await prisma.product.count({ where });
-
-        console.log(`✅ ${products.length} products found for "${q}" (Shop ${shopId}, Page ${page})`);
 
         return res.status(200).json({
             success: true,
@@ -409,11 +384,7 @@ exports.searchProducts = async (req, res) => {
             hasMore: skip + products.length < total,
         });
     } catch (err) {
-        console.error("❌ Error in searchProducts:", err);
-        return res.status(500).json({
-            success: false,
-            message: "Server error while searching products",
-            error: err.message,
-        });
+        console.error('❌ Error in searchProducts:', err);
+        return res.status(500).json({ success: false, message: 'Server error while searching products', error: err.message });
     }
 };

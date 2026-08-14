@@ -27,8 +27,13 @@ function getAreaConversionFactor(unit) {
   return oneUnitInCm * oneUnitInCm; // sq cm per sq unit
 }
 
+function getLengthConversionFactor(unit) {
+  return convertToCm(1, unit); // cm per unit — for LENGTH-mode price normalization
+}
+
 module.exports = {
   convertToCm,
   calculateAreaCm2,
   getAreaConversionFactor,
+  getLengthConversionFactor,
 };

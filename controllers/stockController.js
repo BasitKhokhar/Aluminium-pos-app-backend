@@ -1,37 +1,50 @@
 const prisma = require('../prisma/client');
 
-// Manually add/remove stock
+const VALID_TYPES = ['IN', 'OUT', 'PACK_BREAK'];
+
+// Manually add/remove stock, or break a sealed pack into loose units.
 exports.addStockLog = async (req, res) => {
-    const { shopId, productId, type, quantity, price, description } = req.body;
+    const { productId, type, quantity, price, description } = req.body;
+    const shopId = req.tenant.shopId;
+
+    if (!VALID_TYPES.includes(type)) {
+        return res.status(400).json({ message: `type must be one of ${VALID_TYPES.join(', ')}` });
+    }
 
     try {
+        const product = await prisma.product.findFirst({ where: { id: parseInt(productId), shopId } });
+        if (!product) return res.status(404).json({ message: 'Product not found' });
+
         const result = await prisma.$transaction(async (tx) => {
-            // 1. Create Stock Transaction Log
             const log = await tx.stockTransaction.create({
                 data: {
-                    shopId: parseInt(shopId),
-                    productId: parseInt(productId),
-                    type, // IN or OUT
+                    shopId,
+                    productId: product.id,
+                    type,
                     quantity: parseFloat(quantity),
                     price: price ? parseFloat(price) : null,
                     description,
                 },
             });
 
-            // 2. Update Product Stock Quantity
-            const updateData = {};
-            if (type === 'IN') {
-                updateData.stockQuantity = { increment: parseFloat(quantity) };
-            } else if (type === 'OUT') {
-                updateData.stockQuantity = { decrement: parseFloat(quantity) };
+            let updateData = {};
+            if (type === 'PACK_BREAK') {
+                updateData = {
+                    stockPacks: { decrement: parseFloat(quantity) },
+                    stockLooseUnits: { increment: parseFloat(quantity) * (product.packSize || 1) },
+                };
+            } else if (product.stockType === 'PACK') {
+                updateData = { [type === 'IN' ? 'stockPacks' : 'stockLooseUnits']: { [type === 'IN' ? 'increment' : 'decrement']: parseFloat(quantity) } };
+            } else {
+                updateData = { stockQuantity: { [type === 'IN' ? 'increment' : 'decrement']: parseFloat(quantity) } };
             }
 
-            const product = await tx.product.update({
-                where: { id: parseInt(productId) },
+            const updatedProduct = await tx.product.update({
+                where: { id: product.id, shopId },
                 data: updateData,
             });
 
-            return { log, product };
+            return { log, product: updatedProduct };
         });
 
         res.json({ message: 'Stock updated successfully', ...result });
@@ -41,25 +54,19 @@ exports.addStockLog = async (req, res) => {
     }
 };
 
-// Get stock transaction history for a product or shop
+// Get stock transaction history for the shop, optionally filtered by product
 exports.getStockLogs = async (req, res) => {
     try {
-        const { shopId, productId } = req.query;
+        const { productId } = req.query;
+        const shopId = req.tenant.shopId;
 
-        const where = {};
-        if (shopId) where.shopId = parseInt(shopId);
+        const where = { shopId };
         if (productId) where.productId = parseInt(productId);
-
-        if (Object.keys(where).length === 0) {
-            return res.status(400).json({ message: 'shopId or productId is required' });
-        }
 
         const logs = await prisma.stockTransaction.findMany({
             where,
-            include: {
-                product: { select: { name: true } }
-            },
-            orderBy: { createdAt: 'desc' }
+            include: { product: { select: { name: true } } },
+            orderBy: { createdAt: 'desc' },
         });
 
         res.json(logs);
@@ -73,46 +80,32 @@ exports.getStockLogs = async (req, res) => {
 exports.getProductStockInDetails = async (req, res) => {
     try {
         const { productId, startDate, endDate, type = 'IN' } = req.query;
+        const shopId = req.tenant.shopId;
 
         if (!productId || !startDate || !endDate) {
             return res.status(400).json({ message: 'productId, startDate, and endDate are required' });
         }
 
-        const where = {
-            productId: parseInt(productId),
-        };
+        const where = { shopId, productId: parseInt(productId) };
 
-        // 🟢 TYPE FILTER (IN, OUT, or all)
         if (type !== 'all') {
-            where.type = type; // IN or OUT
+            where.type = type;
         }
 
-        // 📅 DATE RANGE FILTER
-        if (startDate && endDate) {
-            where.createdAt = {
-                gte: new Date(startDate + "T00:00:00.000Z"),
-                lte: new Date(endDate + "T23:59:59.999Z"),
-            };
-        }
+        where.createdAt = {
+            gte: new Date(startDate + 'T00:00:00.000Z'),
+            lte: new Date(endDate + 'T23:59:59.999Z'),
+        };
 
         const logs = await prisma.stockTransaction.findMany({
             where,
             include: {
-                product: {
-                    select: {
-                        name: true,
-                        purchasePrice: true,
-                        salePrice: true
-                    }
-                }
+                product: { select: { name: true, purchasePrice: true, salePrice: true } },
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: { createdAt: 'desc' },
         });
 
-        res.json({
-            success: true,
-            logs
-        });
+        res.json({ success: true, logs });
     } catch (err) {
         console.error('Get Product Stock In Details Error:', err);
         res.status(500).json({ success: false, error: err.message });

@@ -1,4 +1,4 @@
-const { convertToCm, calculateAreaCm2, getAreaConversionFactor } = require('./utils/unitConverter');
+const { convertToCm, calculateAreaCm2, getAreaConversionFactor } = require('../../utils/unitConverter');
 
 function simulatePriceAdjustment(purchasePrice, unit) {
     const areaFactor = getAreaConversionFactor(unit);

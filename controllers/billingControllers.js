@@ -1,58 +1,63 @@
 const prisma = require('../prisma/client');
+const { normalizeStockType } = require('../utils/stockType');
+const { applyBillItemStock } = require('../services/billStockService');
+const { adjustCustomerBalance } = require('../services/customerService');
 
 // Create a new Bill
 exports.createBill = async (req, res) => {
-    const { shopId, customerName, customerPhone, subtotal, discount, totalAmount, totalReceived, changeDue, remainingDue, items, status } = req.body;
-    console.log("data in craete bill api", req.body)
+    const { customerName, customerPhone, customerId, subtotal, discount, totalAmount, totalReceived, changeDue, remainingDue, items, status } = req.body;
+    const shopId = req.tenant.shopId;
+
     try {
-        // Start a transaction
         const result = await prisma.$transaction(async (tx) => {
-            // 1. Create the Bill
+            const parsedCustomerId = customerId ? parseInt(customerId) : null;
+            const parsedRemainingDue = parseFloat(remainingDue) || 0;
+
             const bill = await tx.bill.create({
                 data: {
-                    shopId: parseInt(shopId),
+                    shopId,
                     customerName,
                     customerPhone,
+                    customerId: parsedCustomerId,
                     subtotal: parseFloat(subtotal) || 0,
                     discount: parseFloat(discount) || 0,
                     totalAmount: parseFloat(totalAmount) || 0,
                     totalReceived: parseFloat(totalReceived) || 0,
                     changeDue: parseFloat(changeDue) || 0,
-                    remainingDue: parseFloat(remainingDue) || 0,
-                    status: status || 'pending',
+                    remainingDue: parsedRemainingDue,
+                    status: (status || 'pending').toUpperCase(),
                 },
             });
 
-            // 2. Loop through items to create BillItems and update Stock
+            // Khata sale — the unpaid portion is added to the customer's running balance.
+            if (parsedCustomerId && parsedRemainingDue > 0) {
+                await adjustCustomerBalance(tx, parsedCustomerId, parsedRemainingDue);
+            }
+
             const billItems = [];
             for (const item of items) {
                 const productId = parseInt(item.productId);
-
                 if (isNaN(productId)) {
                     throw new Error(`Invalid or missing productId for item: ${item.productName || 'Unknown'}`);
                 }
 
-                const quantity = parseFloat(item.quantity) || 0;
-                const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
-                const total = parseFloat(item.total) || (quantity * pricePerUnit);
-
-                // Fetch product details for accurate sheet quantity calculation
-                const product = await tx.product.findUnique({ where: { id: productId } });
+                const product = await tx.product.findFirst({ where: { id: productId, shopId } });
                 if (!product) throw new Error(`Product with ID ${productId} not found`);
 
-                let sheetsUsed = quantity;
-                if (item.stockType === 'area' && product.sheetAreaCm2) {
-                    sheetsUsed = (parseFloat(item.totalArea) || 0) / product.sheetAreaCm2;
-                }
+                const stockType = normalizeStockType(item.stockType);
+                const quantity = parseFloat(item.quantity) || 0;
+                const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
+                const total = parseFloat(item.total) || quantity * pricePerUnit;
 
-                // Create BillItem
                 const billItem = await tx.billItem.create({
                     data: {
                         billId: bill.id,
-                        productId: productId,
-                        productName: item.productName || 'No Product',
-                        stockType: item.stockType || 'quantity',
+                        productId,
+                        productName: item.productName || product.name,
+                        stockType,
                         quantity,
+                        packQuantity: parseFloat(item.packQuantity) || null,
+                        looseQuantity: parseFloat(item.looseQuantity) || null,
                         unit: item.unit || null,
                         width: parseFloat(item.width) || null,
                         height: parseFloat(item.height) || null,
@@ -65,30 +70,14 @@ exports.createBill = async (req, res) => {
                 });
                 billItems.push(billItem);
 
-                // Update Product Stock based on stockType
-                const updateData = {};
-                if (item.stockType === 'area') {
-                    updateData.stockAreaCm2 = { decrement: parseFloat(item.totalArea) || 0 };
-                    // 🔥 Sync sheet count (stockQuantity) for area-based items
-                    updateData.stockQuantity = { decrement: sheetsUsed };
-                } else if (item.stockType === 'length') {
-                    updateData.stockLengthCm = { decrement: parseFloat(item.lengthCm) || 0 };
-                } else {
-                    updateData.stockQuantity = { decrement: quantity };
-                }
+                const { quantityForLog } = await applyBillItemStock(tx, product, { ...item, stockType }, -1);
 
-                await tx.product.update({
-                    where: { id: productId },
-                    data: updateData,
-                });
-
-                // Log Stock Transaction (OUT)
                 await tx.stockTransaction.create({
                     data: {
-                        shopId: parseInt(shopId),
-                        productId: productId,
+                        shopId,
+                        productId,
                         type: 'OUT',
-                        quantity: sheetsUsed, // 🔥 Log value in sheets
+                        quantity: quantityForLog,
                         price: pricePerUnit,
                         description: `Sold in Bill #${bill.id}`,
                     },
@@ -106,78 +95,32 @@ exports.createBill = async (req, res) => {
 };
 
 // Get all bills for a shop (paginated)
-// exports.getBills = async (req, res) => {
-//     try {
-//         const { shopId } = req.query;
-//         const page = parseInt(req.query.page) || 1;
-//         const limit = parseInt(req.query.limit) || 10;
-//         const skip = (page - 1) * limit;
-
-//         if (!shopId) return res.status(400).json({ message: 'shopId is required' });
-
-//         const where = { shopId: parseInt(shopId) };
-
-//         const bills = await prisma.bill.findMany({
-//             where,
-//             include: {
-//                 _count: { select: { items: true } }
-//             },
-//             orderBy: { createdAt: 'desc' },
-//             skip,
-//             take: limit,
-//         });
-
-//         const total = await prisma.bill.count({ where });
-//         const hasMore = skip + limit < total;
-
-//         res.json({
-//             success: true,
-//             bills,
-//             total,
-//             page,
-//             limit,
-//             hasMore,
-//         });
-//     } catch (err) {
-//         console.error('Get Bills Error:', err);
-//         res.status(500).json({ success: false, message: 'Server error', error: err.message });
-//     }
-// };
 exports.getBills = async (req, res) => {
     try {
-        const { shopId, status = "all", startDate, endDate } = req.query;
+        const { status = 'all', startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
 
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
 
-        if (!shopId) {
-            return res.status(400).json({ message: "shopId is required" });
+        const where = { shopId, isDeleted: false };
+
+        if (status !== 'all') {
+            where.status = status.toUpperCase();
         }
 
-        const where = {
-            shopId: parseInt(shopId),
-        };
-
-        // 🟣 STATUS FILTER
-        if (status !== "all") {
-            where.status = status;
-        }
-
-        // 📅 DATE RANGE FILTER
         if (startDate && endDate) {
             where.createdAt = {
-                gte: new Date(startDate + "T00:00:00.000Z"),
-                lte: new Date(endDate + "T23:59:59.999Z"),
+                gte: new Date(startDate + 'T00:00:00.000Z'),
+                lte: new Date(endDate + 'T23:59:59.999Z'),
             };
         }
 
         const bills = await prisma.bill.findMany({
             where,
-            include: {
-                _count: { select: { items: true } },
-            },
-            orderBy: { createdAt: "desc" },
+            include: { _count: { select: { items: true } } },
+            orderBy: { createdAt: 'desc' },
             skip,
             take: limit,
         });
@@ -185,41 +128,22 @@ exports.getBills = async (req, res) => {
         const total = await prisma.bill.count({ where });
         const hasMore = skip + limit < total;
 
-        res.json({
-            success: true,
-            bills,
-            total,
-            page,
-            limit,
-            hasMore,
-        });
-
+        res.json({ success: true, bills, total, page, limit, hasMore });
     } catch (err) {
-        console.error("Get Bills Error:", err);
-        res.status(500).json({
-            success: false,
-            message: "Server error",
-            error: err.message,
-        });
+        console.error('Get Bills Error:', err);
+        res.status(500).json({ success: false, message: 'Server error', error: err.message });
     }
 };
 
-
-// Get single bill with items
+// Get single bill with items (ownership resolved by middleware.tenantContext.byResourceId)
 exports.getBillById = async (req, res) => {
     try {
-        const { id } = req.params;
-        console.log("id", id);
-        const bill = await prisma.bill.findUnique({
-            where: { id: parseInt(id) },
+        const bill = await prisma.bill.findFirst({
+            where: { id: parseInt(req.params.id), shopId: req.tenant.shopId },
             include: {
-                items: {
-                    include: {
-                        product: true
-                    }
-                },
-                shop: true
-            }
+                items: { include: { product: true } },
+                shop: true,
+            },
         });
 
         if (!bill) return res.status(404).json({ message: 'Bill not found' });
@@ -230,16 +154,16 @@ exports.getBillById = async (req, res) => {
     }
 };
 
-// Update an existing Bill
+// Update an existing Bill — reverts old items' stock, then reapplies the new set.
 exports.updateBill = async (req, res) => {
-    const { id } = req.params;
-    const { shopId, customerName, customerPhone, subtotal, discount, totalAmount, totalReceived, changeDue, remainingDue, items, status, NewRecivedPyament } = req.body;
+    const billId = parseInt(req.params.id);
+    const shopId = req.tenant.shopId;
+    const { customerName, customerPhone, subtotal, discount, totalAmount, totalReceived, changeDue, remainingDue, items, status, NewRecivedPyament } = req.body;
 
     try {
         const result = await prisma.$transaction(async (tx) => {
-            // 1. Fetch the existing bill and its items
-            const existingBill = await tx.bill.findUnique({
-                where: { id: parseInt(id) },
+            const existingBill = await tx.bill.findFirst({
+                where: { id: billId, shopId },
                 include: { items: true },
             });
 
@@ -247,53 +171,27 @@ exports.updateBill = async (req, res) => {
                 throw new Error('Bill not found');
             }
 
-            // 2. Revert Old Items (Stock and Transactions)
+            // Revert old items' stock
             for (const oldItem of existingBill.items) {
-                const product = await tx.product.findUnique({ where: { id: oldItem.productId } });
-                
-                // Return stock based on stockType
-                const revertData = {};
-                let revertQuantity = oldItem.quantity || 0;
+                const product = await tx.product.findFirst({ where: { id: oldItem.productId, shopId } });
+                if (!product) continue;
 
-                if (oldItem.stockType === 'area') {
-                    const totalArea = parseFloat(oldItem.totalArea) || 0;
-                    revertData.stockAreaCm2 = { increment: totalArea };
-                    
-                    // 🔥 Calculate original sheets used to revert sheet count
-                    if (product && product.sheetAreaCm2) {
-                        revertQuantity = totalArea / product.sheetAreaCm2;
-                    }
-                    revertData.stockQuantity = { increment: revertQuantity };
-                } else if (oldItem.stockType === 'length') {
-                    revertData.stockLengthCm = { increment: parseFloat(oldItem.lengthCm) || 0 };
-                } else {
-                    revertData.stockQuantity = { increment: oldItem.quantity || 0 };
-                }
+                const { quantityForLog } = await applyBillItemStock(tx, product, oldItem, +1);
 
-                await tx.product.update({
-                    where: { id: oldItem.productId },
-                    data: revertData,
-                });
-
-                // Log Stock Reversal Transaction (IN)
                 await tx.stockTransaction.create({
                     data: {
-                        shopId: existingBill.shopId,
+                        shopId,
                         productId: oldItem.productId,
-                        type: 'IN', // Reversing the previous sale
-                        quantity: revertQuantity, // 🔥 In sheets
-                        price: oldItem.pricePerUnit || oldItem.price,
+                        type: 'IN',
+                        quantity: quantityForLog,
+                        price: oldItem.pricePerUnit,
                         description: `Reverted for Bill Update #${existingBill.id}`,
                     },
                 });
             }
 
-            // Delete old items
-            await tx.billItem.deleteMany({
-                where: { billId: existingBill.id },
-            });
+            await tx.billItem.deleteMany({ where: { billId: existingBill.id } });
 
-            // 3. Update the Bill
             let finalTotalReceived = parseFloat(totalReceived) || 0;
             let finalRemainingDue = parseFloat(remainingDue) || 0;
 
@@ -301,12 +199,16 @@ exports.updateBill = async (req, res) => {
                 const addedPayment = parseFloat(NewRecivedPyament) || 0;
                 finalTotalReceived += addedPayment;
                 finalRemainingDue -= addedPayment;
+
+                // Paying down a khata bill reduces the customer's running balance.
+                if (existingBill.customerId) {
+                    await adjustCustomerBalance(tx, existingBill.customerId, -addedPayment);
+                }
             }
 
             const updatedBill = await tx.bill.update({
-                where: { id: existingBill.id },
+                where: { id: existingBill.id, shopId },
                 data: {
-                    shopId: parseInt(shopId),
                     customerName,
                     customerPhone,
                     subtotal: parseFloat(subtotal) || 0,
@@ -315,40 +217,34 @@ exports.updateBill = async (req, res) => {
                     totalReceived: finalTotalReceived,
                     changeDue: parseFloat(changeDue) || 0,
                     remainingDue: finalRemainingDue,
-                    status: status || 'pending',
+                    status: (status || 'pending').toUpperCase(),
                 },
             });
 
-            // 4. Insert New Items
             const newBillItems = [];
             for (const item of items) {
                 const productId = parseInt(item.productId);
-
                 if (isNaN(productId)) {
                     throw new Error(`Invalid or missing productId for item: ${item.productName || 'Unknown'}`);
                 }
 
-                const quantity = parseFloat(item.quantity) || 0;
-                const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
-                const total = parseFloat(item.total) || (quantity * pricePerUnit);
-
-                // Fetch product for accurate quantity tracking
-                const product = await tx.product.findUnique({ where: { id: productId } });
+                const product = await tx.product.findFirst({ where: { id: productId, shopId } });
                 if (!product) throw new Error(`Product with ID ${productId} not found`);
 
-                let sheetsUsed = quantity;
-                if (item.stockType === 'area' && product.sheetAreaCm2) {
-                    sheetsUsed = (parseFloat(item.totalArea) || 0) / product.sheetAreaCm2;
-                }
+                const stockType = normalizeStockType(item.stockType);
+                const quantity = parseFloat(item.quantity) || 0;
+                const pricePerUnit = parseFloat(item.pricePerUnit) || 0;
+                const total = parseFloat(item.total) || quantity * pricePerUnit;
 
-                // Create BillItem
                 const billItem = await tx.billItem.create({
                     data: {
                         billId: updatedBill.id,
-                        productId: productId,
-                        productName: item.productName || 'No Product',
-                        stockType: item.stockType || 'quantity',
+                        productId,
+                        productName: item.productName || product.name,
+                        stockType,
                         quantity,
+                        packQuantity: parseFloat(item.packQuantity) || null,
+                        looseQuantity: parseFloat(item.looseQuantity) || null,
                         unit: item.unit || null,
                         width: parseFloat(item.width) || null,
                         height: parseFloat(item.height) || null,
@@ -361,29 +257,14 @@ exports.updateBill = async (req, res) => {
                 });
                 newBillItems.push(billItem);
 
-                // Update Product Stock based on stockType
-                const updateData = {};
-                if (item.stockType === 'area') {
-                    updateData.stockAreaCm2 = { decrement: parseFloat(item.totalArea) || 0 };
-                    updateData.stockQuantity = { decrement: sheetsUsed }; // 🔥 Sync sheet count
-                } else if (item.stockType === 'length') {
-                    updateData.stockLengthCm = { decrement: parseFloat(item.lengthCm) || 0 };
-                } else {
-                    updateData.stockQuantity = { decrement: quantity };
-                }
+                const { quantityForLog } = await applyBillItemStock(tx, product, { ...item, stockType }, -1);
 
-                await tx.product.update({
-                    where: { id: productId },
-                    data: updateData,
-                });
-
-                // Log Stock Transaction (OUT)
                 await tx.stockTransaction.create({
                     data: {
-                        shopId: parseInt(shopId),
-                        productId: productId,
+                        shopId,
+                        productId,
                         type: 'OUT',
-                        quantity: sheetsUsed, // 🔥 Value in sheets
+                        quantity: quantityForLog,
                         price: pricePerUnit,
                         description: `Sold in Updated Bill #${updatedBill.id}`,
                     },

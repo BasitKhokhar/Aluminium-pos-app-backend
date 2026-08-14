@@ -8,15 +8,104 @@ datasource db {
 }
 
 //////////////////////////////////////////////////////
-// ADMIN TABLE (Super Admin SaaS Owner)
+// ENUMS
 //////////////////////////////////////////////////////
 
-model Admin {
-  id           Int      @id @default(autoincrement())
+enum StockType {
+  QUANTITY
+  AREA
+  LENGTH
+  PACK
+}
+
+enum BillStatus {
+  PENDING
+  PAID
+}
+
+enum PlanTier {
+  FREE_TRIAL
+  LIFETIME
+  CLOUD_SYNC
+}
+
+enum BillingCycle {
+  MONTHLY
+  SEMIANNUAL
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  GRACE_PERIOD
+  PAUSED
+  EXPIRED
+  CANCELLED
+  PENDING
+}
+
+enum PaymentProvider {
+  REVENUECAT
+  MANUAL
+}
+
+enum PaymentStatus {
+  PAID
+  FAILED
+  REFUNDED
+  PENDING
+}
+
+//////////////////////////////////////////////////////
+// PLATFORM / TENANT IDENTITY
+//////////////////////////////////////////////////////
+
+// SaaS platform owner (you / your team) — manages ShopTypes, plans, and admins.
+model SuperAdmin {
+  id           Int     @id @default(autoincrement())
   name         String
-  email        String   @unique
+  email        String  @unique
   password     String
   refreshToken String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Shop owner — the actual tenant/customer who signs up and runs their POS.
+model Admin {
+  id           Int     @id @default(autoincrement())
+  name         String
+  email        String  @unique
+  phone        String?
+  password     String
+  refreshToken String?
+  isActive     Boolean @default(true) // superadmin suspension switch
+
+  shops         Shop[]
+  subscriptions UserSubscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+}
+
+// A configurable business vertical (aluminum, tiles, general store, pharmacy, ...).
+// Superadmin-managed so new verticals don't require a redeploy.
+model ShopType {
+  id          Int     @id @default(autoincrement())
+  code        String  @unique // "GLASS_ALUMINUM" | "TILES_MARBLE" | "GENERAL_STORE" | "PHARMACY" | ...
+  label       String
+  labelUrdu   String?
+  description String?
+  icon        String?
+
+  defaultStockType    StockType @default(QUANTITY) // UI hint only — never a DB constraint on Product
+  suggestedCategories Json? // e.g. ["Tablets","Syrups"] — seeded as real Category rows once, at shop creation
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
 
   shops Shop[]
 
@@ -25,29 +114,35 @@ model Admin {
 }
 
 //////////////////////////////////////////////////////
-// SHOP TABLE (Multi Shop Support)
+// SHOP (Tenant boundary — multi shop support per Admin)
 //////////////////////////////////////////////////////
 
 model Shop {
-  id      Int    @id @default(autoincrement())
-  adminId Int
+  id         Int @id @default(autoincrement())
+  adminId    Int
+  shopTypeId Int
 
   name    String
   address String?
   phone   String?
   logo    String?
 
-  admin Admin @relation(fields: [adminId], references: [id])
-  categories Category[]
+  admin    Admin    @relation(fields: [adminId], references: [id])
+  shopType ShopType @relation(fields: [shopTypeId], references: [id])
 
-  products Product[]
-  bills    Bill[]
-  stockLogs StockTransaction[]
+  categories       Category[]
+  products         Product[]
+  bills            Bill[]
+  stockLogs        StockTransaction[]
+  devices          Device[]
+  customers        Customer[]
+  customerPayments CustomerPayment[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([adminId])
+  @@index([shopTypeId])
 }
 
 //////////////////////////////////////////////////////
@@ -55,61 +150,84 @@ model Shop {
 //////////////////////////////////////////////////////
 
 model Category {
-  id    Int     @id @default(autoincrement())
+  id     Int     @id @default(autoincrement())
   shopId Int
-  name  String  @unique
-  image String?
+  name   String
+  image  String?
 
-  shop Shop @relation(fields: [shopId], references: [id])
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
 
+  clientId String? // client-generated UUID, idempotent sync push key
+  deviceId String? // device that last wrote this row
+
+  shop     Shop      @relation(fields: [shopId], references: [id])
   products Product[]
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, name])
+  @@unique([shopId, clientId])
+  @@index([shopId, updatedAt])
 }
 
 //////////////////////////////////////////////////////
-// PRODUCT TABLE (Stock Master Table)
+// PRODUCT TABLE (Stock Master Table — generalized across verticals)
 //////////////////////////////////////////////////////
 
 model Product {
-  id            Int     @id @default(autoincrement())
-  shopId        Int
-  categoryId    Int?
+  id         Int  @id @default(autoincrement())
+  shopId     Int
+  categoryId Int?
 
-  name          String
-  image         String?
+  name  String
+  image String?
 
   // 🔥 Stock Control Mode
-  stockType     String  @default("quantity") // quantity | area | length
+  stockType StockType @default(QUANTITY)
 
-  // Quantity Stock
-  stockQuantity Float   @default(0)
+  // -------- Quantity mode --------
+  stockQuantity Float @default(0)
 
-  // Area Stock (stored in CM²)
-  stockAreaCm2  Float   @default(0)
-
-  // Length Stock (stored in CM)
-  stockLengthCm Float   @default(0)
-
-  // Sheet Info (For Area-Based Products)
+  // -------- Area mode (sheet/slab, stored in CM²) --------
+  stockAreaCm2  Float  @default(0)
   sheetWidthCm  Float?
   sheetHeightCm Float?
   sheetAreaCm2  Float?
 
+  // -------- Length mode (stored in CM) --------
+  stockLengthCm Float @default(0)
+
+  // -------- Pack mode (box of N units) --------
+  packSize          Int? // units per pack, e.g. 6
+  stockPacks        Float  @default(0) // full unopened packs in stock
+  stockLooseUnits   Float  @default(0) // units broken out of a pack, sold individually
+  packPurchasePrice Float? // optional bulk cost per whole pack (falls back to purchasePrice*packSize)
+  packSalePrice     Float? // optional bulk sale price per whole pack (falls back to salePrice*packSize)
+
   purchasePrice Float
   salePrice     Float
+
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+
+  clientId String?
+  deviceId String?
 
   shop     Shop      @relation(fields: [shopId], references: [id])
   category Category? @relation(fields: [categoryId], references: [id])
 
   billItems BillItem[]
   stockLogs StockTransaction[]
-  
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([shopId, clientId])
   @@index([shopId])
+  @@index([shopId, categoryId])
+  @@index([shopId, updatedAt])
 }
 
 //////////////////////////////////////////////////////
@@ -117,57 +235,71 @@ model Product {
 //////////////////////////////////////////////////////
 
 model Bill {
-  id            Int    @id @default(autoincrement())
-  shopId        Int
+  id     Int @id @default(autoincrement())
+  shopId Int
 
   customerName  String
   customerPhone String?
 
-  subtotal    Float
-  discount    Float @default(0)
-  totalAmount Float
+  subtotal      Float
+  discount      Float      @default(0)
+  totalAmount   Float
   totalReceived Float
-  changeDue Float
-  remainingDue Float @default(0)
-  status String @default("pending") // paid | pending
+  changeDue     Float
+  remainingDue  Float      @default(0)
+  status        BillStatus @default(PENDING)
 
-  shop  Shop @relation(fields: [shopId], references: [id])
-  items BillItem[]
+  isDeleted Boolean   @default(false) // voided bill — tombstone for sync
+  deletedAt DateTime?
+
+  clientId String? // idempotency key for offline-created bills
+  deviceId String?
+
+  customerId Int? // optional link to a saved Customer (walk-in sales stay null, use customerName/customerPhone only)
+
+  shop     Shop       @relation(fields: [shopId], references: [id])
+  customer Customer?  @relation(fields: [customerId], references: [id])
+  items    BillItem[]
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
+  @@unique([shopId, clientId])
   @@index([shopId])
+  @@index([shopId, updatedAt])
   @@index([createdAt])
+  @@index([customerId])
 }
 
 //////////////////////////////////////////////////////
-// BILL ITEMS TABLE (Invoice Product Details)
+// BILL ITEMS TABLE (Invoice Line Items — syncs as part of parent Bill)
 //////////////////////////////////////////////////////
 
 model BillItem {
-  id        Int   @id @default(autoincrement())
+  id        Int @id @default(autoincrement())
   billId    Int
   productId Int
 
   productName String
+  stockType   StockType
 
-  // 🔥 Item Type
-  stockType String // quantity | area | length
+  // -------- Quantity / Pack modes --------
+  quantity      Float? // used for quantity mode and area-mode sheet count
+  packQuantity  Float? // whole packs sold on this line
+  looseQuantity Float? // loose units sold on this line
 
-  // -------- Quantity Mode --------
-  quantity Float?  //use for both unitbase items & areabaseditems
-
-  // -------- Area Mode --------
+  // -------- Area mode --------
   unit      String? // cm | feet | inch | meter
   width     Float?
   height    Float?
-  unitArea   Float?  // always stored in cm²
-  totalArea   Float?  //multiply unitArea * quantity
-  // -------- Length Mode --------
-  lengthCm  Float?
+  unitArea  Float? // always stored in cm²
+  totalArea Float? // unitArea * quantity
+
+  // -------- Length mode --------
+  lengthCm Float?
 
   // -------- Pricing --------
-  pricePerUnit Float    //use for both unitbase items & areabaseditems
+  pricePerUnit Float
   total        Float
 
   bill    Bill    @relation(fields: [billId], references: [id])
@@ -180,29 +312,225 @@ model BillItem {
 }
 
 //////////////////////////////////////////////////////
-// STOCK TRANSACTION HISTORY (MOST IMPORTANT TABLE ⭐)
+// STOCK TRANSACTION HISTORY (append-only ledger)
 //////////////////////////////////////////////////////
 
 model StockTransaction {
-  id        Int    @id @default(autoincrement())
-
+  id        Int @id @default(autoincrement())
   shopId    Int
   productId Int
 
-  type String   // IN or OUT
+  // "IN" | "OUT" | "PACK_BREAK" — kept String (app-validated allow-list), not enum,
+  // so new reasons (ADJUSTMENT, DAMAGE, RETURN) don't require a migration.
+  type String
 
   quantity Float
   price    Float?
 
   description String?
 
+  clientId String?
+  deviceId String?
+
   shop    Shop    @relation(fields: [shopId], references: [id])
   product Product @relation(fields: [productId], references: [id])
 
   createdAt DateTime @default(now())
 
+  @@unique([shopId, clientId])
   @@index([shopId])
   @@index([productId])
   @@index([type])
   @@index([createdAt])
+}
+
+//////////////////////////////////////////////////////
+// DEVICE (per-install registration, backs maxDevices + sync audit columns)
+//////////////////////////////////////////////////////
+
+model Device {
+  id         Int       @id @default(autoincrement())
+  shopId     Int
+  deviceId   String // client-generated stable install UUID
+  deviceName String?
+  platform   String? // "android" | "ios" | "web"
+  isActive   Boolean   @default(true)
+  lastSeenAt DateTime  @default(now())
+  lastSyncAt DateTime?
+
+  shop Shop @relation(fields: [shopId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([shopId, deviceId])
+  @@index([shopId])
+}
+
+//////////////////////////////////////////////////////
+// CUSTOMER / KHATA LEDGER (credit customers + running balance)
+//////////////////////////////////////////////////////
+
+// A shop's saved customer, tracked for credit ("khata") sales. `balance` is a
+// maintained ledger total (not derived live from bills at read time) — it is
+// the single source of truth for "how much does this customer owe", adjusted
+// atomically alongside every Bill/CustomerPayment write that touches it.
+model Customer {
+  id     Int @id @default(autoincrement())
+  shopId Int
+
+  name  String
+  phone String?
+
+  balance Float @default(0) // positive = customer owes the shop
+
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+
+  clientId String?
+  deviceId String?
+
+  shop     Shop              @relation(fields: [shopId], references: [id])
+  bills    Bill[]
+  payments CustomerPayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, clientId])
+  @@index([shopId])
+  @@index([shopId, updatedAt])
+}
+
+// Append-only ledger of khata payments a customer makes that aren't tied to
+// settling one specific Bill (e.g. "Sana paid Rs 2,000 against her balance
+// today"). Mirrors StockTransaction's append-only shape.
+model CustomerPayment {
+  id         Int @id @default(autoincrement())
+  shopId     Int
+  customerId Int
+
+  amount Float
+  note   String?
+
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+
+  clientId String?
+  deviceId String?
+
+  shop     Shop     @relation(fields: [shopId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([shopId, clientId])
+  @@index([shopId])
+  @@index([customerId])
+}
+
+//////////////////////////////////////////////////////
+// SUBSCRIPTIONS / BILLING
+//////////////////////////////////////////////////////
+
+// Catalog / display shell — the plans a shop can subscribe to.
+model SubscriptionPlan {
+  id          Int     @id @default(autoincrement())
+  code        String  @unique // "FREE_TRIAL" | "LIFETIME" | "CLOUD_SYNC_MONTHLY" | "CLOUD_SYNC_SEMIANNUAL" | "CLOUD_SYNC_YEARLY"
+  name        String
+  description String?
+
+  tier         PlanTier
+  billingCycle BillingCycle? // null for FREE_TRIAL / LIFETIME
+
+  price    Float
+  currency String @default("PKR")
+
+  durationDays Int? // FREE_TRIAL's editable length in days; null for LIFETIME/CLOUD_SYNC
+  isLifetime   Boolean @default(false)
+  isRecurring  Boolean @default(false)
+  isTrialPlan  Boolean @default(false)
+
+  cloudEnabled   Boolean @default(false)
+  offlineEnabled Boolean @default(true)
+  maxDevices     Int     @default(1)
+
+  revenueCatProductId String? @unique // maps to the RevenueCat/store product identifier
+
+  features  Json? // display-only bullet list for a pricing page
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  subscriptions UserSubscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// The actual entitlement record — single source of truth for what a shop owner can do.
+// Never duplicated onto Admin/Shop; entitlement is always computed by reading this table.
+model UserSubscription {
+  id      Int @id @default(autoincrement())
+  adminId Int
+  planId  Int
+
+  status      SubscriptionStatus @default(PENDING)
+  startDate   DateTime           @default(now())
+  expiryDate  DateTime? // null = lifetime
+  cancelledAt DateTime?
+  isTrial     Boolean            @default(false)
+
+  paymentProvider PaymentProvider
+  billingCycle    BillingCycle?
+  pricePaid       Float?
+  priceCurrency   String?         @default("PKR")
+
+  // RevenueCat / store identifiers
+  revenueCatAppUserId   String?
+  originalTransactionId String?
+  productId             String? // RevenueCat product_id at purchase time
+  store                 String? // "PLAY_STORE" | "APP_STORE" | "STRIPE" | "PROMOTIONAL"
+
+  // Entitlement snapshot copied from plan at purchase/assignment time.
+  cloudEnabled   Boolean @default(false)
+  offlineEnabled Boolean @default(true)
+  maxDevices     Int     @default(1)
+
+  assignedBySuperAdminId Int? // set when paymentProvider = MANUAL
+
+  admin    Admin                 @relation(fields: [adminId], references: [id])
+  plan     SubscriptionPlan      @relation(fields: [planId], references: [id])
+  payments SubscriptionPayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([adminId])
+  @@index([adminId, status])
+  @@index([status, expiryDate])
+  @@index([revenueCatAppUserId])
+}
+
+// Audit ledger — one row per RevenueCat webhook event / manual charge.
+model SubscriptionPayment {
+  id             Int @id @default(autoincrement())
+  subscriptionId Int
+
+  amount          Float
+  currency        String          @default("PKR")
+  paymentProvider PaymentProvider
+  paymentStatus   PaymentStatus
+
+  transactionId     String?
+  revenueCatEventId String? @unique // webhook idempotency key
+  eventType         String? // raw RevenueCat event.type, for audit
+  rawPayload        Json?
+
+  paidAt DateTime?
+
+  subscription UserSubscription @relation(fields: [subscriptionId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([subscriptionId])
+  @@index([transactionId])
 }

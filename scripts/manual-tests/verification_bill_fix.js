@@ -1,12 +1,12 @@
-const { createBill } = require('./controllers/billingControllers');
-const prisma = require('./prisma/client');
+const { createBill } = require('../../controllers/billingControllers');
+const prisma = require('../../prisma/client');
 
 async function testFix() {
     console.log("Starting verification test...");
 
     const mockReq = {
+        tenant: { adminId: 1, shopId: 1 },
         body: {
-            shopId: 1,
             customerName: 'Basit',
             customerPhone: '03154949862',
             subtotal: 1347.99,

@@ -1,50 +1,41 @@
 const prisma = require('../prisma/client');
 const bucketStorage = require('../utils/bucketStorage');
+const { seedDefaultCategoriesForShop } = require('../services/shopTypeService');
 const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Create a new Shop
+// Create an additional shop under the same admin (the first shop is created
+// as part of POST /auth/admin/register, not here).
 exports.createShop = [
-    upload.single("logo"),
+    upload.single('logo'),
     async (req, res) => {
         try {
-            const { name, address, phone } = req.body;
+            const { name, address, phone, shopTypeCode } = req.body;
             const file = req.file;
+            const adminId = req.admin.id;
 
-            console.log("📥 Creating shop:", name, address, phone);
-            console.log("📥 Shop logo file:", file);
+            if (!shopTypeCode) {
+                return res.status(400).json({ message: 'shopTypeCode is required' });
+            }
 
-            const adminId = req.admin.id; // From verifyAdminToken middleware
+            const shopType = await prisma.shopType.findUnique({ where: { code: shopTypeCode } });
+            if (!shopType || !shopType.isActive) {
+                return res.status(400).json({ message: 'Invalid shopTypeCode' });
+            }
 
             let logoUrl = req.body.logo;
-
-            // Upload logo if provided
             if (file && file.buffer) {
-                // Remove folder prefix since 'HamdanPOS' is already in .env paths.
-                // This ensures images go directly into /ImagesBucket/HamdanPOS/
                 const filename = `${Date.now()}_${file.originalname}`;
-                logoUrl = await bucketStorage.uploadImageFromBuffer(
-                    file.buffer,
-                    file.mimetype,
-                    filename
-                );
+                logoUrl = await bucketStorage.uploadImageFromBuffer(file.buffer, file.mimetype, filename);
             }
-            console.log("payload sendign to create shop:", {
-                name,
-                address,
-                phone,
-                logo: logoUrl,
-                adminId,
-            });
-            const shop = await prisma.shop.create({
-                data: {
-                    name,
-                    address,
-                    phone,
-                    logo: logoUrl,
-                    adminId,
-                },
+
+            const shop = await prisma.$transaction(async (tx) => {
+                const created = await tx.shop.create({
+                    data: { name, address, phone, logo: logoUrl, adminId, shopTypeId: shopType.id },
+                });
+                await seedDefaultCategoriesForShop(tx, created.id, shopType);
+                return created;
             });
 
             res.status(201).json({ message: 'Shop created successfully', shop, id: shop.id });
@@ -52,7 +43,7 @@ exports.createShop = [
             console.error('Create Shop Error:', err);
             res.status(500).json({ error: err.message });
         }
-    }
+    },
 ];
 
 // Get all shops for the logged-in admin
@@ -62,10 +53,9 @@ exports.getShops = async (req, res) => {
         const shops = await prisma.shop.findMany({
             where: { adminId },
             include: {
-                _count: {
-                    select: { products: true, bills: true }
-                }
-            }
+                shopType: true,
+                _count: { select: { products: true, bills: true } },
+            },
         });
 
         res.json(shops);
@@ -82,15 +72,11 @@ exports.getShopById = async (req, res) => {
         const adminId = req.admin.id;
 
         const shop = await prisma.shop.findFirst({
-            where: {
-                id: parseInt(id),
-                adminId: adminId,
-            },
+            where: { id: parseInt(id), adminId },
             include: {
-                _count: {
-                    select: { products: true, bills: true }
-                }
-            }
+                shopType: true,
+                _count: { select: { products: true, bills: true } },
+            },
         });
 
         if (!shop) return res.status(404).json({ message: 'Shop not found' });
@@ -104,7 +90,7 @@ exports.getShopById = async (req, res) => {
 
 // Update a shop
 exports.updateShop = [
-    upload.single("logo"),
+    upload.single('logo'),
     async (req, res) => {
         try {
             const { id } = req.params;
@@ -112,22 +98,13 @@ exports.updateShop = [
             const file = req.file;
             const adminId = req.admin.id;
 
-            const existingShop = await prisma.shop.findFirst({
-                where: { id: parseInt(id), adminId }
-            });
-
+            const existingShop = await prisma.shop.findFirst({ where: { id: parseInt(id), adminId } });
             if (!existingShop) return res.status(404).json({ message: 'Shop not found or unauthorized' });
 
             let logoUrl = req.body.logo || existingShop.logo;
-
-            // Upload new logo if provided
             if (file && file.buffer) {
                 const filename = `${Date.now()}_${file.originalname}`;
-                logoUrl = await bucketStorage.uploadImageFromBuffer(
-                    file.buffer,
-                    file.mimetype,
-                    filename
-                );
+                logoUrl = await bucketStorage.uploadImageFromBuffer(file.buffer, file.mimetype, filename);
             }
 
             const shop = await prisma.shop.update({
@@ -140,7 +117,7 @@ exports.updateShop = [
             console.error('Update Shop Error:', err);
             res.status(500).json({ error: err.message });
         }
-    }
+    },
 ];
 
 // Delete a shop
@@ -149,16 +126,10 @@ exports.deleteShop = async (req, res) => {
         const { id } = req.params;
         const adminId = req.admin.id;
 
-        // Check if shop exists and belongs to admin
-        const shop = await prisma.shop.findFirst({
-            where: { id: parseInt(id), adminId }
-        });
-
+        const shop = await prisma.shop.findFirst({ where: { id: parseInt(id), adminId } });
         if (!shop) return res.status(404).json({ message: 'Shop not found or unauthorized' });
 
-        await prisma.shop.delete({
-            where: { id: parseInt(id) }
-        });
+        await prisma.shop.delete({ where: { id: parseInt(id) } });
 
         res.json({ message: 'Shop deleted successfully' });
     } catch (err) {
@@ -166,4 +137,3 @@ exports.deleteShop = async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 };
-

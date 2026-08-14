@@ -1,13 +1,12 @@
-const { getDashboardStats } = require('./controllers/DashboardController');
-const prisma = require('./prisma/client');
+const { getDashboardStats } = require('../../controllers/DashboardController');
+const prisma = require('../../prisma/client');
 
 async function testDashboard() {
     console.log("Starting Dashboard verification test...");
 
     const mockReq = {
-        query: {
-            shopId: 1
-        }
+        tenant: { adminId: 1, shopId: 1 },
+        query: {}
     };
 
     const mockRes = {

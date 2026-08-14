@@ -1,29 +1,47 @@
 const prisma = require('../prisma/client');
+const analyticsService = require('../services/analyticsService');
+
+function stockUnitsFor(product) {
+    switch (product.stockType) {
+        case 'AREA':
+            return product.stockAreaCm2 || 0;
+        case 'LENGTH':
+            return product.stockLengthCm || 0;
+        case 'PACK':
+            return (product.stockPacks || 0) * (product.packSize || 1) + (product.stockLooseUnits || 0);
+        default:
+            return product.stockQuantity || 0;
+    }
+}
+
+function billItemUnitsFor(item) {
+    switch (item.stockType) {
+        case 'AREA':
+            return item.totalArea || 0;
+        case 'LENGTH':
+            return item.lengthCm || 0;
+        case 'PACK':
+            return item.total || 0; // pack-mode cost/sale already priced per whole line in `total`
+        default:
+            return item.quantity || 0;
+    }
+}
 
 /**
  * Get Dashboard Stats
- * URL: /api/dashboard/stats
+ * URL: /dashboard/stats
  * Method: GET
  */
 exports.getDashboardStats = async (req, res) => {
     try {
-        const { shopId, startDate, endDate } = req.query;
-        console.log("shopId", shopId)
-        console.log("startDate", startDate)
-        console.log("endDate", endDate)
+        const { startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
 
-        if (!shopId) {
-            return res.status(400).json({ status: 'error', message: 'shopId is required' });
-        }
-
-        const parsedShopId = parseInt(shopId);
-
-        // Date range filtering
-        const where = { shopId: parsedShopId };
+        const where = { shopId, isDeleted: false };
         if (startDate && endDate) {
             where.createdAt = {
-                gte: new Date(startDate + "T00:00:00.000Z"),
-                lte: new Date(endDate + "T23:59:59.999Z"),
+                gte: new Date(startDate + 'T00:00:00.000Z'),
+                lte: new Date(endDate + 'T23:59:59.999Z'),
             };
         }
 
@@ -32,13 +50,7 @@ exports.getDashboardStats = async (req, res) => {
             where,
             include: {
                 items: {
-                    include: {
-                        product: {
-                            select: {
-                                purchasePrice: true,
-                            },
-                        },
-                    },
+                    include: { product: { select: { purchasePrice: true, packPurchasePrice: true, packSize: true } } },
                 },
             },
         });
@@ -48,17 +60,15 @@ exports.getDashboardStats = async (req, res) => {
 
         const totalRevenue = bills.reduce((sum, bill) => {
             const billProfit = bill.items.reduce((itemSum, item) => {
-                // Total Sale Price for this item is already stored in item.total
                 const itemSalePrice = item.total || 0;
-
-                // Calculate item cost based on stock type factor
                 const costPricePerBaseUnit = item.product?.purchasePrice || 0;
 
-                let factor = item.quantity || 0;
-                if (item.stockType === 'area') {
-                    factor = item.totalArea || 0;
-                } else if (item.stockType === 'length') {
-                    factor = item.lengthCm || 0;
+                let factor;
+                if (item.stockType === 'PACK') {
+                    const packSize = item.product?.packSize || 1;
+                    factor = (item.packQuantity || 0) * packSize + (item.looseQuantity || 0);
+                } else {
+                    factor = billItemUnitsFor(item);
                 }
 
                 const itemCostPrice = costPricePerBaseUnit * factor;
@@ -69,73 +79,66 @@ exports.getDashboardStats = async (req, res) => {
 
         // 2. Total Inventory Value
         const products = await prisma.product.findMany({
-            where: { shopId: parsedShopId },
+            where: { shopId, isDeleted: false },
             select: {
                 stockType: true,
                 stockQuantity: true,
                 stockAreaCm2: true,
                 stockLengthCm: true,
+                stockPacks: true,
+                stockLooseUnits: true,
+                packSize: true,
                 salePrice: true,
+                packSalePrice: true,
                 name: true,
                 id: true,
             },
         });
 
         const totalInventoryValue = products.reduce((sum, prod) => {
-            let stock = prod.stockQuantity || 0;
-            if (prod.stockType === 'area') {
-                stock = prod.stockAreaCm2 || 0;
-            } else if (prod.stockType === 'length') {
-                stock = prod.stockLengthCm || 0;
+            if (prod.stockType === 'PACK') {
+                const packSize = prod.packSize || 1;
+                const packSaleValue = prod.packSalePrice || prod.salePrice * packSize;
+                return sum + (prod.stockPacks || 0) * packSaleValue + (prod.stockLooseUnits || 0) * prod.salePrice;
             }
-            return sum + (prod.salePrice * stock);
+            return sum + prod.salePrice * stockUnitsFor(prod);
         }, 0);
 
-        // 3. Low Stock Alerts
+        // 3. Low Stock Alerts (base-unit stock below threshold, across all stock types)
         const lowStockThreshold = 10;
         const lowStockAlerts = products
-            .filter(prod => prod.stockQuantity < lowStockThreshold)
-            .map(prod => ({
+            .filter((prod) => stockUnitsFor(prod) < lowStockThreshold)
+            .map((prod) => ({
                 id: `PRD-${prod.id}`,
                 name: prod.name,
-                stock: prod.stockQuantity,
+                stock: stockUnitsFor(prod),
             }))
-            .slice(0, 5); // Limit to top 5 for the dashboard
+            .slice(0, 5);
 
         // 4. Revenue Analytics (Grouped by Day)
-        // For simplicity, we'll aggregate from the fetched bills
+        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
         const analyticsMap = {};
 
-        // If range is provided, identify if it's weekly or monthly
-        // Here we just map by day name or date based on range
-        // For the design mockup format (Mon, Tue...), we'll use day names if it's roughly a week
-        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
-        bills.forEach(bill => {
+        bills.forEach((bill) => {
             const date = new Date(bill.createdAt);
             const label = days[date.getDay()];
             analyticsMap[label] = (analyticsMap[label] || 0) + bill.totalAmount;
         });
 
-        const revenueAnalytics = days.map(day => ({
+        const revenueAnalytics = days.map((day) => ({
             label: day,
             value: analyticsMap[day] || 0,
         }));
 
         // 5. Recent Invoices
         const recentInvoices = await prisma.bill.findMany({
-            where: { shopId: parsedShopId },
+            where: { shopId, isDeleted: false },
             take: 10,
             orderBy: { createdAt: 'desc' },
-            select: {
-                id: true,
-                customerName: true,
-                totalAmount: true,
-                createdAt: true,
-            },
+            select: { id: true, customerName: true, totalAmount: true, createdAt: true },
         });
 
-        const formattedRecentInvoices = recentInvoices.map(inv => ({
+        const formattedRecentInvoices = recentInvoices.map((inv) => ({
             id: `INV-${inv.id}`,
             customer: inv.customerName,
             amount: inv.totalAmount,
@@ -153,9 +156,123 @@ exports.getDashboardStats = async (req, res) => {
             lowStockAlerts,
             recentInvoices: formattedRecentInvoices,
         });
-
     } catch (err) {
         console.error('Get Dashboard Stats Error:', err);
+        res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
+    }
+};
+
+/**
+ * Sales Trend (week/month/year buckets)
+ * URL: /dashboard/analytics/sales-trend
+ * Method: GET
+ */
+exports.getSalesTrend = async (req, res) => {
+    try {
+        const { period, startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
+        const data = await analyticsService.getSalesTrend({ shopId, period, startDate, endDate });
+        res.json({ period: period || 'week', data });
+    } catch (err) {
+        console.error('Get Sales Trend Error:', err);
+        res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
+    }
+};
+
+/**
+ * Sales By Product
+ * URL: /dashboard/analytics/by-product
+ * Method: GET
+ */
+exports.getSalesByProduct = async (req, res) => {
+    try {
+        const { startDate, endDate, limit } = req.query;
+        const shopId = req.tenant.shopId;
+        const data = await analyticsService.getSalesByProduct({
+            shopId,
+            startDate,
+            endDate,
+            limit: limit ? parseInt(limit, 10) : undefined,
+        });
+        res.json({ data });
+    } catch (err) {
+        console.error('Get Sales By Product Error:', err);
+        res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
+    }
+};
+
+/**
+ * Sales By Category
+ * URL: /dashboard/analytics/by-category
+ * Method: GET
+ */
+exports.getSalesByCategory = async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
+        const data = await analyticsService.getSalesByCategory({ shopId, startDate, endDate });
+        res.json({ data });
+    } catch (err) {
+        console.error('Get Sales By Category Error:', err);
+        res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
+    }
+};
+
+/**
+ * Profit Margin Trend (week/month/year buckets)
+ * URL: /dashboard/analytics/profit-margin
+ * Method: GET
+ */
+exports.getProfitMarginTrend = async (req, res) => {
+    try {
+        const { period, startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
+        const data = await analyticsService.getProfitMarginTrend({ shopId, period, startDate, endDate });
+        res.json({ period: period || 'week', data });
+    } catch (err) {
+        console.error('Get Profit Margin Trend Error:', err);
+        res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
+    }
+};
+
+function csvEscape(value) {
+    const str = value === null || value === undefined ? '' : String(value);
+    if (/[",\n]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+}
+
+function rowsToCsv(rows) {
+    if (!rows.length) return '';
+    const columns = Object.keys(rows[0]);
+    const header = columns.map(csvEscape).join(',');
+    const lines = rows.map((row) => columns.map((col) => csvEscape(row[col])).join(','));
+    return [header, ...lines].join('\n');
+}
+
+/**
+ * Export Analytics as CSV
+ * URL: /dashboard/export
+ * Method: GET
+ */
+exports.exportAnalyticsCsv = async (req, res) => {
+    try {
+        const { report, period, startDate, endDate } = req.query;
+        const shopId = req.tenant.shopId;
+
+        if (!report) {
+            return res.status(400).json({ status: 'error', message: 'Missing required query param: report' });
+        }
+
+        const rows = await analyticsService.buildExportRows({ shopId, report, period, startDate, endDate });
+        const csv = rowsToCsv(rows);
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${report}-${Date.now()}.csv"`);
+        res.send(csv);
+    } catch (err) {
+        console.error('Export Analytics CSV Error:', err);
         res.status(500).json({ status: 'error', message: 'Server error', error: err.message });
     }
 };
